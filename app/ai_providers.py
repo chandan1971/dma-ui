@@ -35,7 +35,7 @@ logger = logging.getLogger("dma-ui.ai")
 # Provider-default models (used when AI_MODEL is unset).
 CLAUDE_DEFAULT_MODEL = "claude-opus-5"
 OPENAI_DEFAULT_MODEL = "gpt-4o"
-GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
+GEMINI_DEFAULT_MODEL = "gemini-3.6-flash"
 
 PROVIDER_NAMES = ("mock", "claude", "openai", "local", "gemini")
 
