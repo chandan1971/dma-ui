@@ -2627,6 +2627,7 @@ function wireTabs() {
     // The "history" pane is the Trading Journal (journal.js) — the pane id is
     // kept for workspace-state continuity with saved layouts.
     if (name === "history") onJournalActive();
+    if (name === "funding") onFundingActive();
     if (name === "ai") onAIActive();
     // Execution panel refreshes its day window only while the Trade tab shows.
     if (name === "dashboard") onExecActive();
@@ -4241,6 +4242,122 @@ function renderHistoryAnalytics(closedList, fees, makerCount, takerCount) {
 // helpers (plain text) or pre-escaped strings — never raw exchange data.
 function jTile(label, value, cls) {
   return `<div class="j-tile"><div class="k">${esc(label)}</div><div class="v priv ${cls || ""}">${value}</div></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// FUNDING TAB — funding-fee analytics over the Trades mirror (execType =
+// "Funding"). Aggregates (Σ execFee, avg feeRate) are computed SERVER-side
+// over every matching document; the table shows only the newest rows, and the
+// note under it says so whenever the two differ. Filters: symbol + "since"
+// (inclusive >= date-time). Read-only, no polling — fetches on tab activation
+// and on Apply.
+// ---------------------------------------------------------------------------
+let _fdWired = false;
+
+function onFundingActive() {
+  if (!_fdWired) {
+    _fdWired = true;
+    fdWire();
+  }
+  fdLoad(); // refetch on every visit: cheap Mongo read, keeps the lens fresh
+}
+
+function fdWire() {
+  const since = document.getElementById("fd-since");
+  if (since && !since.value) since.value = fdLocalInputValue(Date.now() - 30 * 86_400_000);
+  const apply = () => fdLoad();
+  document.getElementById("fd-apply")?.addEventListener("click", apply);
+  document.getElementById("fd-symbol")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") apply();
+  });
+  since?.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
+}
+
+// datetime-local wants "YYYY-MM-DDTHH:mm" in LOCAL time (no timezone suffix).
+function fdLocalInputValue(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function fdLoad() {
+  const synced = document.getElementById("fd-synced");
+  const rowsEl = document.getElementById("fd-rows");
+  if (!rowsEl) return;
+  const sym = (document.getElementById("fd-symbol")?.value || "").trim().toUpperCase();
+  const sinceRaw = document.getElementById("fd-since")?.value || "";
+  const params = new URLSearchParams();
+  if (sym) params.set("symbol", sym);
+  if (sinceRaw) {
+    const ms = Date.parse(sinceRaw); // local time, per datetime-local semantics
+    if (isFinite(ms)) params.set("startTime", String(ms));
+  }
+  if (synced) synced.textContent = "Loading…";
+  let r;
+  try {
+    r = (await api(`/api/funding?${params.toString()}`)).result || {};
+  } catch (err) {
+    if (synced) synced.textContent = err.message || "Failed to load funding data";
+    return;
+  }
+  fdRender(r);
+}
+
+function fdRender(r) {
+  const feeEl = document.getElementById("fd-fee-sum");
+  const rateEl = document.getElementById("fd-rate-avg");
+  const rateRaw = document.getElementById("fd-rate-raw");
+  const countEl = document.getElementById("fd-count");
+  const rangeEl = document.getElementById("fd-range");
+  const synced = document.getElementById("fd-synced");
+  const rowsEl = document.getElementById("fd-rows");
+  const note = document.getElementById("fd-note");
+
+  const feeSum = Number(r.feeSum);
+  if (feeEl) {
+    feeEl.textContent = isFinite(feeSum)
+      ? `${fmtMoneySigned(feeSum, 4)} ${curUnit()}` : "—";
+    // A paid fee (positive) is a cost, a negative one is income — color accordingly.
+    feeEl.classList.remove("pos", "neg");
+    if (isFinite(feeSum) && feeSum !== 0) feeEl.classList.add(feeSum > 0 ? "neg" : "pos");
+  }
+  const rateAvg = r.rateAvg === null || r.rateAvg === undefined ? null : Number(r.rateAvg);
+  if (rateEl) rateEl.textContent = rateAvg !== null && isFinite(rateAvg)
+    ? `${(rateAvg * 100).toFixed(4)}%` : "—";
+  if (rateRaw) rateRaw.textContent = rateAvg !== null && isFinite(rateAvg)
+    ? `raw ${rateAvg}` : "no parseable rates in range";
+  if (countEl) countEl.textContent = isFinite(Number(r.count)) ? String(r.count) : "—";
+  if (rangeEl) rangeEl.textContent = r.startMs ? `since ${fmtTime(r.startMs)}` : "";
+  if (synced) {
+    synced.textContent = r.lastSyncedMs
+      ? `data synced ${fmtTime(r.lastSyncedMs)}` : "mirror not synced yet";
+  }
+
+  const rows = Array.isArray(r.rows) ? r.rows : [];
+  if (rowsEl) {
+    if (!rows.length) {
+      rowsEl.innerHTML = '<tr><td colspan="4" class="muted">No funding events in this range.</td></tr>';
+    } else {
+      rowsEl.innerHTML = rows.map((row) => {
+        const fee = Number(row.execFee);
+        const feeCls = isFinite(fee) && fee !== 0 ? (fee > 0 ? "neg" : "pos") : "flat";
+        const rate = Number(row.feeRate);
+        return `<tr>
+          <td>${fmtTime(row.execTime)}</td>
+          <td>${esc(row.symbol || "—")}</td>
+          <td>${isFinite(rate) ? esc((rate * 100).toFixed(4)) + "%" : "—"}</td>
+          <td class="${feeCls}">${cvtCell(row.execFee)}</td>
+        </tr>`;
+      }).join("");
+    }
+  }
+  if (note) {
+    const truncated = isFinite(Number(r.count)) && rows.length < Number(r.count);
+    note.hidden = !truncated;
+    if (truncated) {
+      note.textContent = `Showing the newest ${rows.length} of ${r.count} events — the totals above cover all ${r.count}.`;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -2563,3 +2563,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   }
   .explorer-result .table-wrap { max-height: none; }
 }
+
+/* ===== Funding tab (funding-fee analytics) ===== */
+.fd-stats {
+  display: flex; align-items: stretch; gap: 18px; flex-wrap: wrap;
+  padding: 12px 14px; border-bottom: 1px solid var(--border);
+}
+.fd-note { padding: 8px 14px; font-size: 11px; }
+#fd-table td { font-variant-numeric: tabular-nums; }

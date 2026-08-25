@@ -41,6 +41,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           <span>Journal</span>
         </button>
+        <button class="tab" data-tab="funding" role="tab" id="tab-funding" aria-controls="panel-funding" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="19" y1="5" x2="5" y2="19"/><circle cx="6.5" cy="6.5" r="2.5"/><circle cx="17.5" cy="17.5" r="2.5"/></svg>
+          <span>Funding</span>
+        </button>
         <button class="tab" data-tab="ai" role="tab" id="tab-ai" aria-controls="panel-ai" aria-selected="false" tabindex="-1">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.9 4.9L18.8 9.8l-4.9 1.9L12 16.6l-1.9-4.9L5.2 9.8l4.9-1.9L12 3z"/><path d="M19 14.6l.9 2.3 2.3.9-2.3.9-.9 2.3-.9-2.3-2.3-.9 2.3-.9.9-2.3z"/></svg>
           <span>Coach</span>
@@ -715,6 +719,55 @@
         </div>
 
         <!-- ============ AI COACH (read-only intelligence layer) ============ -->
+        <!-- ============ FUNDING (execType=Funding analytics from the Trades mirror) ============ -->
+        <div class="pane" data-pane="funding" id="panel-funding" role="tabpanel" aria-labelledby="tab-funding" hidden>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Funding</h2>
+              <span id="fd-synced" class="muted" role="status" aria-live="polite"></span>
+              <div class="panel-head-actions">
+                <input id="fd-symbol" placeholder="Symbol (blank = all)" aria-label="Filter by symbol"
+                       autocomplete="off" spellcheck="false" style="width: 160px" />
+                <input type="datetime-local" id="fd-since" aria-label="Since date and time" title="Include funding events at or after this date-time" />
+                <button id="fd-apply" class="btn-ghost sm">Apply</button>
+              </div>
+            </div>
+            <div class="fd-stats" role="group" aria-label="Funding totals">
+              <div class="stat stat-primary">
+                <span class="stat-label" title="Sum of execFee over every matching funding event (computed over ALL matching documents, not just the rows shown)">Net funding fee (Σ execFee)</span>
+                <span class="stat-value" id="fd-fee-sum">—</span>
+                <span class="stat-sub">positive = paid · negative = received</span>
+              </div>
+              <div class="stat-div"></div>
+              <div class="stat stat-primary">
+                <span class="stat-label" title="Average feeRate over every matching funding event (unparseable rates excluded)">Avg funding rate (feeRate)</span>
+                <span class="stat-value" id="fd-rate-avg">—</span>
+                <span class="stat-sub" id="fd-rate-raw"></span>
+              </div>
+              <div class="stat-div"></div>
+              <div class="stat">
+                <span class="stat-label">Funding events</span>
+                <span class="stat-value" id="fd-count">—</span>
+                <span class="stat-sub" id="fd-range"></span>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table id="fd-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Symbol</th>
+                    <th title="Funding rate applied (feeRate)">Rate</th>
+                    <th title="Funding fee for this event (execFee)">Fee</th>
+                  </tr>
+                </thead>
+                <tbody id="fd-rows"><tr><td colspan="4" class="muted">Open this tab to load funding data.</td></tr></tbody>
+              </table>
+            </div>
+            <div id="fd-note" class="muted fd-note" hidden></div>
+          </section>
+        </div>
+
         <div class="pane" data-pane="ai" id="panel-ai" role="tabpanel" aria-labelledby="tab-ai" hidden>
           <section class="panel ai-panel">
             <div class="panel-head ai-head">

@@ -247,3 +247,61 @@ def test_transactions_501_when_gateway_lacks_endpoint(admin_client, monkeypatch)
     resp = admin_client.get("/api/transactions")
     assert resp.status_code == 501
     assert "transaction log" in resp.json()["detail"]
+
+
+# ---- /api/funding (funding-fee analytics over the Trades mirror) -------------
+
+def _seed_funding(fake_db, ts, *, sym="BTCUSDT", fee="0.05", rate="0.0001", i=None):
+    _id = f"f-{sym}-{ts}-{i or 0}"
+    fake_db[db_mod.TRADES][_id] = {
+        "_id": _id, "tsMs": ts, "syncedAt": "X", "execId": _id,
+        "symbol": sym, "execType": "Funding", "execFee": fee, "feeRate": rate,
+        "execTime": str(ts),
+    }
+
+
+def test_funding_sums_fees_and_averages_rates(admin_client, fake_db, monkeypatch):
+    _freeze_now(monkeypatch)
+    _seed_funding(fake_db, FIXED_NOW_MS - 1_000, fee="0.05", rate="0.0001")
+    _seed_funding(fake_db, FIXED_NOW_MS - 2_000, fee="-0.02", rate="0.0003")
+    # A regular trade fill in range must NOT count toward funding stats.
+    fake_db[db_mod.TRADES]["t1"] = {
+        "_id": "t1", "tsMs": FIXED_NOW_MS - 1_500, "syncedAt": "X",
+        "execId": "t1", "symbol": "BTCUSDT", "execType": "Trade",
+        "execFee": "9.99", "feeRate": "0.00055",
+    }
+
+    resp = admin_client.get("/api/funding")
+    assert resp.status_code == 200
+    r = resp.json()["result"]
+    assert r["count"] == 2
+    assert abs(r["feeSum"] - 0.03) < 1e-9
+    assert abs(r["rateAvg"] - 0.0002) < 1e-12
+    assert r["startMs"] == FIXED_NOW_MS - 30 * DAY_MS, "default lookback is 30d"
+    assert len(r["rows"]) == 2 and r["rows"][0]["execType"] == "Funding"
+    assert "tsMs" not in r["rows"][0], "raw exchange rows only"
+
+
+def test_funding_symbol_and_since_filters(admin_client, fake_db, monkeypatch):
+    _freeze_now(monkeypatch)
+    since = FIXED_NOW_MS - 5 * DAY_MS
+    _seed_funding(fake_db, since - 1, sym="ETHUSDT", fee="100", rate="0.9", i=1)
+    _seed_funding(fake_db, since, sym="ETHUSDT", fee="0.10", rate="0.0001", i=2)
+    _seed_funding(fake_db, since + 1, sym="BTCUSDT", fee="0.40", rate="0.0004", i=3)
+
+    resp = admin_client.get(
+        "/api/funding", params={"symbol": "ethusdt", "startTime": str(since)}
+    )
+    assert resp.status_code == 200
+    r = resp.json()["result"]
+    assert r["count"] == 1, "startTime is INCLUSIVE and >=; other symbols excluded"
+    assert abs(r["feeSum"] - 0.10) < 1e-9
+    assert r["rows"][0]["symbol"] == "ETHUSDT"
+
+
+def test_funding_empty_range_is_honest(admin_client, fake_db, monkeypatch):
+    _freeze_now(monkeypatch)
+    resp = admin_client.get("/api/funding")
+    r = resp.json()["result"]
+    assert r["count"] == 0 and r["feeSum"] == 0 and r["rows"] == []
+    assert r["rateAvg"] is None, "no data -> null average, never a fabricated 0"

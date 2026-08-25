@@ -209,6 +209,54 @@ async def bulk_upsert(kind: str, docs: list[dict]) -> tuple[int, int]:
     return (result.upserted_count, result.matched_count)
 
 
+async def funding_stats(
+    *, symbol: str | None, start_ms: int, end_ms: int, recent_limit: int = 200
+) -> dict:
+    """Aggregate funding executions (execType == "Funding") in [start_ms,
+    end_ms], optionally symbol-filtered: exact sum of execFee, average feeRate,
+    event count, plus the newest `recent_limit` raw rows for the table. The
+    numeric work happens IN MongoDB so the sum covers every matching document —
+    a Python-side loop over a capped read would silently under-report the fee
+    total the moment the range outgrows the cap."""
+    filt: dict = {"execType": "Funding", "tsMs": {"$gte": start_ms, "$lte": end_ms}}
+    if symbol:
+        filt["symbol"] = symbol
+
+    def _dec(field: str) -> dict:
+        # Exchange numerics are strings; unparseable/missing -> null, which
+        # $sum/$avg skip — one malformed record must not zero the whole answer.
+        return {"$convert": {"input": f"${field}", "to": "decimal",
+                             "onError": None, "onNull": None}}
+
+    pipeline = [
+        {"$match": filt},
+        {"$group": {
+            "_id": None,
+            "feeSum": {"$sum": _dec("execFee")},
+            "rateAvg": {"$avg": _dec("feeRate")},
+            "count": {"$sum": 1},
+        }},
+        # Decimal128 keeps the summation exact; JSON needs plain numbers out.
+        # ($toDouble passes null through, so an all-unparseable rateAvg stays
+        # null — the UI shows "—" rather than a fabricated 0.)
+        {"$project": {"_id": 0, "count": 1,
+                      "feeSum": {"$toDouble": "$feeSum"},
+                      "rateAvg": {"$toDouble": "$rateAvg"}}},
+    ]
+    cursor = await collection(TRADES).aggregate(pipeline)
+    agg = await cursor.to_list(length=1)
+    stats = agg[0] if agg else {"feeSum": 0.0, "rateAvg": None, "count": 0}
+
+    rows_cursor = (
+        collection(TRADES)
+        .find(filt, projection={"_id": 0, "tsMs": 0, "syncedAt": 0})
+        .sort("tsMs", DESCENDING)
+        .limit(recent_limit)
+    )
+    stats["rows"] = await rows_cursor.to_list(length=recent_limit)
+    return stats
+
+
 async def query_history(
     kind: str, *, symbol: str | None, start_ms: int, end_ms: int, limit: int
 ) -> list[dict]:

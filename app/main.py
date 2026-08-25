@@ -854,6 +854,39 @@ async def api_transactions(
     return _history_envelope(rows, len(rows) >= _HISTORY_READ_MAX, db.TRANSACTIONS)
 
 
+@app.get("/api/funding")
+async def api_funding(
+    symbol: str | None = None,
+    startTime: str | None = None,
+    user: dict = Depends(current_user),
+):
+    # Funding-fee analytics over the Trades mirror (execType == "Funding"):
+    # exact sum of execFee, average feeRate, count, and the newest rows.
+    # `startTime` is an inclusive epoch-ms LOWER bound ("since"; the range
+    # always ends now) — default lookback 30 days. Read-only, both roles.
+    now_ms = int(time.time() * 1000)
+    start_ms = _parse_ms(startTime, "startTime")
+    if start_ms is None:
+        start_ms = now_ms - 30 * 86_400_000
+    try:
+        stats = await db.funding_stats(
+            symbol=_norm_symbol_opt(symbol), start_ms=start_ms, end_ms=now_ms
+        )
+    except (PyMongoError, BSONError, OSError):
+        logger.exception("funding stats read failed: mongo unavailable")
+        raise HTTPException(status_code=503, detail="history database unavailable")
+    return {
+        "retCode": 0,
+        "retMsg": "OK",
+        "result": {
+            **stats,
+            "startMs": start_ms,
+            "lastSyncedMs": history_sync.last_synced_ms(db.TRADES),
+            "nowMs": now_ms,
+        },
+    }
+
+
 @app.get("/api/withdrawable")
 async def api_withdrawable(coin: str | None = None, user: dict = Depends(current_user)):
     return await dma_client.get_withdrawable(_norm_coin_opt(coin))

@@ -95,6 +95,35 @@ def fake_db(monkeypatch):
                 store[kind][d["_id"]] = dict(d)
         return (upserted, matched)
 
+    async def funding_stats(*, symbol, start_ms, end_ms, recent_limit=200):
+        # Mirrors the Mongo pipeline: Funding-only match, exact fee sum,
+        # rate average over PARSEABLE values only, newest-first raw rows.
+        docs = [
+            d for d in store[db_mod.TRADES].values()
+            if d.get("execType") == "Funding"
+            and start_ms <= d["tsMs"] <= end_ms
+            and (not symbol or d.get("symbol") == symbol)
+        ]
+        docs.sort(key=lambda d: d["tsMs"], reverse=True)
+
+        def num(d, key):
+            try:
+                return float(d.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        fees = [v for v in (num(d, "execFee") for d in docs) if v is not None]
+        rates = [v for v in (num(d, "feeRate") for d in docs) if v is not None]
+        return {
+            "feeSum": sum(fees),
+            "rateAvg": (sum(rates) / len(rates)) if rates else None,
+            "count": len(docs),
+            "rows": [
+                {k: v for k, v in d.items() if k not in ("_id", "tsMs", "syncedAt")}
+                for d in docs[:recent_limit]
+            ],
+        }
+
     async def query_history(kind, *, symbol, start_ms, end_ms, limit):
         rows = [
             d for d in store[kind].values()
@@ -193,6 +222,7 @@ def fake_db(monkeypatch):
     monkeypatch.setattr(db_mod, "latest_ts_ms", latest_ts_ms)
     monkeypatch.setattr(db_mod, "bulk_upsert", bulk_upsert)
     monkeypatch.setattr(db_mod, "query_history", query_history)
+    monkeypatch.setattr(db_mod, "funding_stats", funding_stats)
     monkeypatch.setattr(db_mod, "ai_conv_list", ai_conv_list)
     monkeypatch.setattr(db_mod, "ai_conv_get", ai_conv_get)
     monkeypatch.setattr(db_mod, "ai_conv_create", ai_conv_create)
