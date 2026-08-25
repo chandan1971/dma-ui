@@ -152,28 +152,42 @@ def _txn_doc(record: dict, synced_at: datetime) -> dict | None:
     }
 
 
+# The gateway rejects transaction-log queries "earlier than 2 years" (a LIVE
+# 400 from the deployed gateway, so the endpoint itself exists). A cold start
+# at the default SYNC_BACKFILL_DAYS=730 begins EXACTLY 2 years back, which is
+# already over the line by the time the request lands — and the failed run
+# never advances the watermark, so it would re-fail every minute forever. Cap
+# this kind's backfill a safe month inside the rule; ~23 months of ledger is
+# the most the endpoint can serve anyway.
+_TXN_MAX_BACKFILL_DAYS = 700
+
 # Fetchers are late-bound (lambdas) so the dma_client attribute stays
 # monkeypatchable, consistent with every other cross-module seam here.
 # page_limit: per-endpoint page cap (the transaction log caps at 50, half the
 # 100 of the other two) — saturation detection must match what was requested.
+# max_backfill_days: per-endpoint cap on the cold-start lookback (None = the
+# configured SYNC_BACKFILL_DAYS as-is).
 _KINDS = {
     db.TRADES: {
         "label": "trades",
         "fetch": lambda s, e, st: dma_client.get_executions_window(s, e, st),
         "to_doc": _trade_doc,
         "page_limit": dma_client._HISTORY_PAGE_LIMIT,
+        "max_backfill_days": None,
     },
     db.CLOSED_PNL: {
         "label": "closed-pnl",
         "fetch": lambda s, e, st: dma_client.get_closed_pnl_window(s, e, st),
         "to_doc": _pnl_doc,
         "page_limit": dma_client._HISTORY_PAGE_LIMIT,
+        "max_backfill_days": None,
     },
     db.TRANSACTIONS: {
         "label": "transactions",
         "fetch": lambda s, e, st: dma_client.get_transaction_log_window(s, e, st),
         "to_doc": _txn_doc,
         "page_limit": dma_client.TXN_PAGE_LIMIT,
+        "max_backfill_days": _TXN_MAX_BACKFILL_DAYS,
     },
 }
 
@@ -251,7 +265,10 @@ async def sync_kind(kind: str) -> dict:
     spec = _KINDS[kind]
     now_ms = int(time.time() * 1000)
     synced_at = datetime.now(timezone.utc)
-    floor_ms = now_ms - settings.SYNC_BACKFILL_DAYS * 86_400_000
+    backfill_days = settings.SYNC_BACKFILL_DAYS
+    if spec["max_backfill_days"] is not None:
+        backfill_days = min(backfill_days, spec["max_backfill_days"])
+    floor_ms = now_ms - backfill_days * 86_400_000
 
     # The deep-rescan start is capped by the backfill floor: covering down to
     # it counts as a full deep pass even when the floor is shallower than the

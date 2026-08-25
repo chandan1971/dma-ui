@@ -488,3 +488,23 @@ def test_transaction_endpoint_5xx_is_an_incident_not_a_verdict(monkeypatch, fake
     assert not history_sync.is_unsupported(db.TRANSACTIONS), \
         "only 404/405 is a capability verdict; a 5xx must keep retrying"
     assert history_sync._consecutive_failures[db.TRANSACTIONS] == 1
+
+
+def test_transaction_backfill_capped_inside_two_year_gateway_rule(monkeypatch, fake_db):
+    # The gateway 400s transaction-log queries earlier than 2 years, and the
+    # default SYNC_BACKFILL_DAYS=730 starts EXACTLY 2 years back (already over
+    # the line once the request lands). The transactions cold start must be
+    # capped at the safety margin; other kinds keep the configured depth.
+    calls, handlers = _install(monkeypatch, backfill_days=730)
+    handlers["fn"] = lambda path, s, e: []
+
+    asyncio.run(history_sync.sync_kind(db.TRANSACTIONS))
+    txn_calls = [c for c in calls if "transaction-log" in c[0]]
+    expected_floor = FIXED_NOW_MS - history_sync._TXN_MAX_BACKFILL_DAYS * DAY_MS
+    assert txn_calls[0][1] == expected_floor, \
+        "transactions cold start begins at the capped floor, not 730d back"
+
+    asyncio.run(history_sync.sync_kind(db.TRADES))
+    exec_calls = _exec_calls(calls)
+    assert exec_calls[0][1] == FIXED_NOW_MS - 730 * DAY_MS, \
+        "trades keep the full configured backfill depth"
