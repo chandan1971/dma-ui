@@ -207,3 +207,43 @@ def test_mongo_outage_maps_to_503(admin_client, monkeypatch):
         resp = admin_client.get(path)
         assert resp.status_code == 503, path
         assert resp.json()["detail"] == "history database unavailable"
+
+
+# ---- /api/transactions (transaction-log mirror) -----------------------------
+
+def test_transactions_envelope_and_raw_row_passthrough(admin_client, fake_db, monkeypatch):
+    _freeze_now(monkeypatch)
+    row = {"id": "tx1", "symbol": "BTCUSDT", "type": "TRADE", "currency": "USDT",
+           "side": "Buy", "change": "-0.05", "cashBalance": "1000",
+           "transactionTime": str(FIXED_NOW_MS - 1_000)}
+    fake_db[db_mod.TRANSACTIONS]["tx1"] = {
+        **row, "_id": "tx1", "tsMs": FIXED_NOW_MS - 1_000, "syncedAt": "X",
+    }
+
+    resp = admin_client.get("/api/transactions")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["retCode"] == 0
+    assert body["result"]["list"] == [row], \
+        "raw rows only (no _id/tsMs/syncedAt; the gateway's own `id` stays)"
+    assert body["result"]["lastSyncedMs"] is None
+    assert body["result"]["nowMs"] == FIXED_NOW_MS
+
+
+def test_transactions_default_range_and_symbol_filter(admin_client, fake_db, monkeypatch):
+    _freeze_now(monkeypatch)
+    captured = _capture_query(monkeypatch)
+    resp = admin_client.get("/api/transactions", params={"symbol": "ethusdt"})
+    assert resp.status_code == 200
+    assert captured["kind"] == db_mod.TRANSACTIONS
+    assert captured["symbol"] == "ETHUSDT"
+    assert captured["end_ms"] == FIXED_NOW_MS
+    assert captured["end_ms"] - captured["start_ms"] == 30 * DAY_MS, \
+        "same default 30-day preset as /api/closed-pnl"
+
+
+def test_transactions_501_when_gateway_lacks_endpoint(admin_client, monkeypatch):
+    monkeypatch.setattr(history_sync, "_unsupported", {db_mod.TRANSACTIONS})
+    resp = admin_client.get("/api/transactions")
+    assert resp.status_code == 501
+    assert "transaction log" in resp.json()["detail"]

@@ -565,7 +565,16 @@ def healthz():
             "historySyncAgeSeconds": {
                 "trades": _sync_age_s(db.TRADES),
                 "closedPnl": _sync_age_s(db.CLOSED_PNL),
+                "transactions": _sync_age_s(db.TRANSACTIONS),
             },
+            # Verdict of the transaction-log capability probe (the endpoint is
+            # not in the DMA Postman collection): true after the first
+            # successful sync, false once the gateway 404'd it, null while
+            # still unknown (before the first attempt after boot).
+            "transactionLogSupported": (
+                True if history_sync.last_synced_ms(db.TRANSACTIONS)
+                else (False if history_sync.is_unsupported(db.TRANSACTIONS) else None)
+            ),
             # Seconds since the market scanner last sampled the ticker list
             # (null until its first sample, or forever when disabled). Like the
             # sync ages: not sensitive, watchable by a monitor.
@@ -812,6 +821,37 @@ async def api_closed_pnl(
         start_ms=start_ms, end_ms=end_ms, limit=_HISTORY_READ_MAX,
     )
     return _history_envelope(rows, len(rows) >= _HISTORY_READ_MAX, db.CLOSED_PNL)
+
+
+@app.get("/api/transactions")
+async def api_transactions(
+    symbol: str | None = None,
+    days: int | None = None,
+    startTime: str | None = None,
+    endTime: str | None = None,
+    user: dict = Depends(current_user),
+):
+    # Account transaction log (trades, fees, funding, transfers, settlements)
+    # from the MongoDB mirror — same range semantics as /api/closed-pnl. 501
+    # once the sync's capability probe found the gateway doesn't proxy the
+    # endpoint (before that verdict the list is simply empty and lastSyncedMs
+    # null, which the caller can distinguish via /healthz).
+    if history_sync.is_unsupported(db.TRANSACTIONS):
+        raise HTTPException(
+            status_code=501,
+            detail="the DMA gateway does not support the transaction log",
+        )
+    rng = _parse_range(startTime, endTime) if days is None else None
+    if rng:
+        start_ms, end_ms = rng
+    else:
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - _clamp_days(days) * 86_400_000
+    rows = await _query_history_or_503(
+        db.TRANSACTIONS, symbol=_norm_symbol_opt(symbol),
+        start_ms=start_ms, end_ms=end_ms, limit=_HISTORY_READ_MAX,
+    )
+    return _history_envelope(rows, len(rows) >= _HISTORY_READ_MAX, db.TRANSACTIONS)
 
 
 @app.get("/api/withdrawable")

@@ -1,9 +1,16 @@
-"""Background sync: mirror executions & closed-PnL from the exchange into MongoDB.
+"""Background sync: mirror executions, closed-PnL & the transaction log from the
+exchange into MongoDB.
 
 Runs inside the web process (started from the FastAPI lifespan, like the
 Telegram watcher): every SYNC_INTERVAL_SECONDS (default one minute) it brings
-the `Trades` and `Closed-PnL` collections up to date, so the exchange's history
-endpoints are only ever hit from here — the dashboard reads MongoDB (app/db.py). On an empty
+the `Trades`, `Closed-PnL` and `Transactions` collections up to date, so the
+exchange's history endpoints are only ever hit from here — the dashboard reads
+MongoDB (app/db.py). The transaction log is PROBATIONAL: the endpoint is not in
+the DMA Postman collection, so the first live call doubles as a capability
+probe — a 404/405 disables that mirror for the process lifetime (logged once,
+surfaced on /healthz as transactionLogSupported=false, no Telegram alert)
+instead of failing and alerting every minute against a gateway that simply
+doesn't proxy it. On an empty
 collection it backfills SYNC_BACKFILL_DAYS of history in sequential <=7-day
 windows; afterwards each run only covers the span since the newest stored
 record. Fetching stays strictly cursor-free (startTime/endTime windows with
@@ -121,20 +128,66 @@ def _pnl_doc(record: dict, synced_at: datetime) -> dict | None:
     }
 
 
+def _txn_doc(record: dict, synced_at: datetime) -> dict | None:
+    """Storable doc for one transaction-log row, or None if it has no usable
+    timestamp (transactionTime is both the range key and part of the fallback
+    identity — a row without it can neither be read back nor deduped). `_id`
+    prefers the gateway's own `id`; rows without one get a composite of the
+    fields that make a ledger line unique — time, type, currency, the
+    trade/order it came from, the balance delta AND the resulting balance
+    (cashBalance disambiguates two identical same-millisecond entries)."""
+    ts = dma_client._to_int_ms(record.get("transactionTime"))
+    if ts <= 0:
+        return None
+    txn_id = record.get("id") or ":".join(
+        str(record.get(k) or "")
+        for k in ("transactionTime", "type", "currency", "tradeId", "orderId",
+                  "change", "cashBalance")
+    )
+    return {
+        **_clean_record(record),
+        "_id": str(txn_id),
+        "tsMs": ts,
+        "syncedAt": synced_at,
+    }
+
+
 # Fetchers are late-bound (lambdas) so the dma_client attribute stays
 # monkeypatchable, consistent with every other cross-module seam here.
+# page_limit: per-endpoint page cap (the transaction log caps at 50, half the
+# 100 of the other two) — saturation detection must match what was requested.
 _KINDS = {
     db.TRADES: {
         "label": "trades",
         "fetch": lambda s, e, st: dma_client.get_executions_window(s, e, st),
         "to_doc": _trade_doc,
+        "page_limit": dma_client._HISTORY_PAGE_LIMIT,
     },
     db.CLOSED_PNL: {
         "label": "closed-pnl",
         "fetch": lambda s, e, st: dma_client.get_closed_pnl_window(s, e, st),
         "to_doc": _pnl_doc,
+        "page_limit": dma_client._HISTORY_PAGE_LIMIT,
+    },
+    db.TRANSACTIONS: {
+        "label": "transactions",
+        "fetch": lambda s, e, st: dma_client.get_transaction_log_window(s, e, st),
+        "to_doc": _txn_doc,
+        "page_limit": dma_client.TXN_PAGE_LIMIT,
     },
 }
+
+# Kinds whose endpoint is NOT in the DMA Postman collection: the first live
+# call is a capability probe, and a 404/405 permanently (for this process)
+# disables the kind. Trades/closed-PnL are documented endpoints — a 404 there
+# is a gateway incident that must keep failing loudly, never a probe verdict.
+_PROBATIONAL_KINDS = frozenset({db.TRANSACTIONS})
+_unsupported: set = set()
+
+
+def is_unsupported(kind: str) -> bool:
+    """True when the gateway rejected this kind's endpoint as nonexistent."""
+    return kind in _unsupported
 
 # Single-flight: a slow backfill must never overlap the next scheduled run.
 _sync_lock = asyncio.Lock()
@@ -143,11 +196,11 @@ _sync_lock = asyncio.Lock()
 # bound; None until the first successful run after boot). Surfaced to the
 # dashboard via the history endpoints' `result.lastSyncedMs` so users can see
 # how fresh the data is. In-memory only: a restart re-syncs within ~1 minute.
-_last_synced_ms: dict = {db.TRADES: None, db.CLOSED_PNL: None}
+_last_synced_ms: dict = {db.TRADES: None, db.CLOSED_PNL: None, db.TRANSACTIONS: None}
 
 # When each collection last completed a run that covered the full deep-rescan
 # span (epoch ms; 0 = never, so the first run after boot is always deep).
-_last_deep_rescan_ms: dict = {db.TRADES: 0, db.CLOSED_PNL: 0}
+_last_deep_rescan_ms: dict = {db.TRADES: 0, db.CLOSED_PNL: 0, db.TRANSACTIONS: 0}
 
 
 def last_synced_ms(kind: str):
@@ -228,6 +281,7 @@ async def sync_kind(kind: str) -> dict:
         max_requests=_MAX_REQUESTS_PER_RUN,
         min_window_ms=_MIN_BISECT_WINDOW_MS,
         pace_s=_PACE_S,
+        page_limit=spec["page_limit"],
     )
     totals = {"windows": 0, "fetched": 0, "upserted": 0, "matched": 0, "skipped": 0}
     density_warned = False
@@ -268,7 +322,7 @@ async def sync_kind(kind: str) -> dict:
                 "history sync %s: a span <=%ds still saturates the %d-record page; "
                 "records beyond the cap in that span are unreachable without a "
                 "cursor — continuing with the rest of the range",
-                spec["label"], _MIN_BISECT_WINDOW_MS // 1000, dma_client._HISTORY_PAGE_LIMIT,
+                spec["label"], _MIN_BISECT_WINDOW_MS // 1000, state["page_limit"],
             )
         if state["budget_exhausted"]:
             # Transient cap: stop HERE. Later windows must not be fetched, or the
@@ -311,22 +365,42 @@ async def sync_kind(kind: str) -> dict:
 # and going stale, so the operator is alerted out-of-band (Telegram) once —
 # and told again when it recovers. At the 1-minute cadence, 3 ≈ 3 minutes.
 _FAILURES_BEFORE_ALERT = 3
-_consecutive_failures: dict = {db.TRADES: 0, db.CLOSED_PNL: 0}
+_consecutive_failures: dict = {db.TRADES: 0, db.CLOSED_PNL: 0, db.TRANSACTIONS: 0}
 
 
 async def sync_all() -> None:
     """One scheduled run: each collection independently, under the single-flight
-    lock. A failure in one collection is logged and never blocks the other; a
+    lock. A failure in one collection is logged and never blocks the others; a
     failed run leaves the data consistent (see module docstring) so the next
-    run simply resumes."""
+    run simply resumes. A probational kind whose endpoint the gateway rejects
+    as nonexistent (404/405) is disabled for the process lifetime — that is a
+    capability verdict, not an incident."""
     async with _sync_lock:
-        for kind in (db.TRADES, db.CLOSED_PNL):
+        for kind in (db.TRADES, db.CLOSED_PNL, db.TRANSACTIONS):
+            if kind in _unsupported:
+                continue
             label = _KINDS[kind]["label"]
             try:
                 await sync_kind(kind)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                if (
+                    kind in _PROBATIONAL_KINDS
+                    and isinstance(exc, dma_client.DMAError)
+                    and exc.status in (404, 405)
+                ):
+                    # Capability verdict, not an incident: log once, disable,
+                    # and never route this into the failure counter/alert.
+                    _unsupported.add(kind)
+                    logger.warning(
+                        "history sync %s: the gateway does not proxy this "
+                        "endpoint (HTTP %s) — disabling the %s mirror until the "
+                        "next restart (/healthz reports "
+                        "transactionLogSupported=false)",
+                        label, exc.status, label,
+                    )
+                    continue
                 logger.exception(
                     "history sync %s: run failed; data is intact and the next "
                     "run resumes from the last stored record",

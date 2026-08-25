@@ -13,8 +13,9 @@ pointing MONGO_TLS_CA_FILE at a CA bundle on disk; the file itself must never be
 committed (.gitignore covers *.pem/*.crt).
 
 Every function that touches data takes the collection "kind" (TRADES /
-CLOSED_PNL). These helpers are deliberately thin and few: they are the seam the
-tests monkeypatch to run the sync and read paths against an in-memory store.
+CLOSED_PNL / TRANSACTIONS). These helpers are deliberately thin and few: they are
+the seam the tests monkeypatch to run the sync and read paths against an
+in-memory store.
 """
 import os
 import tempfile
@@ -30,7 +31,11 @@ from .config import settings
 # Collection names as provisioned in the DMA-trading database.
 TRADES = "Trades"
 CLOSED_PNL = "Closed-PnL"
-_KINDS = (TRADES, CLOSED_PNL)
+# Account transaction log (trades, fees, funding, transfers, settlements) —
+# mirrored only when the gateway supports the endpoint (probed at runtime by
+# app/history_sync.py; the collection stays empty on an unsupported gateway).
+TRANSACTIONS = "Transactions"
+_KINDS = (TRADES, CLOSED_PNL, TRANSACTIONS)
 
 # Trading-journal annotations. One doc per completed trade, keyed by the SAME
 # natural identity the Closed-PnL mirror uses (`orderId:updatedTime`), so an

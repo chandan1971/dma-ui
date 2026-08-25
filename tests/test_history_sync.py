@@ -58,11 +58,17 @@ def _install(monkeypatch, trades=(), pnls=(), backfill_days=BACKFILL_DAYS):
     monkeypatch.setattr(history_sync.settings, "SYNC_BACKFILL_DAYS", backfill_days)
     # Fresh freshness-stamps per test (writes go into this replacement dict).
     monkeypatch.setattr(history_sync, "_last_synced_ms",
-                        {db.TRADES: None, db.CLOSED_PNL: None})
+                        {db.TRADES: None, db.CLOSED_PNL: None, db.TRANSACTIONS: None})
     # Deep rescans "just ran" by default so incremental tests see the plain
     # watermark-overlap resume; the dedicated deep-rescan test overrides this.
     monkeypatch.setattr(history_sync, "_last_deep_rescan_ms",
-                        {db.TRADES: FIXED_NOW_MS, db.CLOSED_PNL: FIXED_NOW_MS})
+                        {db.TRADES: FIXED_NOW_MS, db.CLOSED_PNL: FIXED_NOW_MS,
+                         db.TRANSACTIONS: FIXED_NOW_MS})
+    # Fresh probe/failure state so no test inherits an "unsupported" verdict
+    # or a failure streak from another.
+    monkeypatch.setattr(history_sync, "_unsupported", set())
+    monkeypatch.setattr(history_sync, "_consecutive_failures",
+                        {db.TRADES: 0, db.CLOSED_PNL: 0, db.TRANSACTIONS: 0})
 
     calls: list[tuple[str, int, int]] = []
 
@@ -372,3 +378,113 @@ def test_sync_all_isolates_kind_failures(monkeypatch, fake_db):
 
     assert not fake_db[db.TRADES], "failed kind stored nothing"
     assert len(fake_db[db.CLOSED_PNL]) == 3, "the other kind still synced fully"
+
+
+# ---- transaction-log mirror (probational endpoint) ---------------------------
+
+def _txn(txn_id, ts, type_="TRADE", symbol="BTCUSDT"):
+    return {"id": txn_id, "symbol": symbol, "type": type_, "currency": "USDT",
+            "side": "Buy", "change": "-0.05", "cashFlow": "0",
+            "cashBalance": "1000", "fee": "0.05", "tradeId": f"t-{txn_id}",
+            "orderId": f"o-{txn_id}", "transactionTime": str(ts)}
+
+
+def test_txn_doc_identity_prefers_id_with_composite_fallback():
+    from datetime import datetime, timezone
+    at = datetime.now(timezone.utc)
+
+    doc = history_sync._txn_doc(_txn("tx1", 123), at)
+    assert doc["_id"] == "tx1" and doc["tsMs"] == 123 and doc["syncedAt"] is at
+
+    # No gateway id -> deterministic composite of the uniqueness fields.
+    rec = _txn("", 456)
+    doc = history_sync._txn_doc(rec, at)
+    assert doc["_id"] == "456:TRADE:USDT:t-:o-:-0.05:1000"
+
+    # No usable timestamp -> no identity, no range key: skip.
+    assert history_sync._txn_doc({"id": "x", "type": "TRADE"}, at) is None
+    assert history_sync._txn_doc({"id": "x", "transactionTime": "junk"}, at) is None
+
+
+def test_transaction_window_requests_limit_50_and_account_type(monkeypatch):
+    seen = {}
+
+    async def fake_get(url, headers=None):
+        parsed = urlparse(url)
+        seen.update(path=parsed.path, q=parse_qs(parsed.query))
+        return _Resp(200, {"retCode": 0, "result": {"list": []}})
+
+    monkeypatch.setattr(dma_client._client, "get", fake_get)
+    state = dma_client.new_history_state(page_limit=dma_client.TXN_PAGE_LIMIT)
+    asyncio.run(dma_client.get_transaction_log_window(0, 1000, state))
+    assert seen["path"].endswith("/v5/account/transaction-log")
+    # 50 (the endpoint's cap), NOT the 100 of the other history endpoints —
+    # limit=100 would make a full 50-record page look unsaturated (data loss).
+    assert seen["q"]["limit"] == ["50"]
+    assert seen["q"]["accountType"] == ["UNIFIED"]
+    assert seen["q"]["category"] == ["linear"]
+
+
+def test_transaction_sync_cold_start_stores_rows(monkeypatch, fake_db):
+    txns = [_txn("t1", W1_TS), _txn("t2", W2_TS), _txn("t3", W3_TS)]
+    calls, handlers = _install(monkeypatch)
+    default = handlers["fn"]
+    handlers["fn"] = (
+        lambda path, s, e: _page(txns, s, e, "transactionTime")
+        if "transaction-log" in path else default(path, s, e)
+    )
+
+    asyncio.run(history_sync.sync_kind(db.TRANSACTIONS))
+
+    assert set(fake_db[db.TRANSACTIONS]) == {"t1", "t2", "t3"}
+    assert fake_db[db.TRANSACTIONS]["t2"]["tsMs"] == W2_TS
+    txn_calls = [c for c in calls if "transaction-log" in c[0]]
+    starts = [c[1] for c in txn_calls]
+    assert len(txn_calls) == 3 and starts == sorted(starts), \
+        "same cursor-free ascending-window walk as the other kinds"
+    assert history_sync.last_synced_ms(db.TRANSACTIONS) == FIXED_NOW_MS
+
+
+def test_unsupported_transaction_endpoint_disables_kind_without_alert(monkeypatch, fake_db):
+    calls, handlers = _install(monkeypatch, trades=THREE_FILLS, pnls=THREE_PNLS)
+    default = handlers["fn"]
+    handlers["fn"] = (
+        lambda path, s, e: _Resp(404, {"message": "no such route"})
+        if "transaction-log" in path else default(path, s, e)
+    )
+    alerts = []
+
+    async def fake_notify(text):
+        alerts.append(text)
+
+    monkeypatch.setattr(history_sync.notifier, "notify", fake_notify)
+
+    asyncio.run(history_sync.sync_all())
+    assert history_sync.is_unsupported(db.TRANSACTIONS)
+    assert set(fake_db[db.TRADES]) == {"e1", "e2", "e3"}, "other kinds unaffected"
+    assert len(fake_db[db.CLOSED_PNL]) == 3
+    probe_calls = len([c for c in calls if "transaction-log" in c[0]])
+    assert probe_calls == 1, "a 404 is non-retryable: the probe is ONE request"
+
+    # Subsequent runs skip the kind entirely — no re-probing every minute.
+    for _ in range(4):
+        asyncio.run(history_sync.sync_all())
+    assert len([c for c in calls if "transaction-log" in c[0]]) == probe_calls
+    assert alerts == [], "a capability verdict must never page the operator"
+    assert history_sync._consecutive_failures[db.TRANSACTIONS] == 0
+    assert history_sync.last_synced_ms(db.TRANSACTIONS) is None
+
+
+def test_transaction_endpoint_5xx_is_an_incident_not_a_verdict(monkeypatch, fake_db):
+    calls, handlers = _install(monkeypatch)
+    default = handlers["fn"]
+    handlers["fn"] = (
+        lambda path, s, e: _Resp(503, {"message": "service unavailable"})
+        if "transaction-log" in path else default(path, s, e)
+    )
+
+    asyncio.run(history_sync.sync_all())  # must not raise (failure isolation)
+
+    assert not history_sync.is_unsupported(db.TRANSACTIONS), \
+        "only 404/405 is a capability verdict; a 5xx must keep retrying"
+    assert history_sync._consecutive_failures[db.TRANSACTIONS] == 1

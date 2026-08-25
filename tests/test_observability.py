@@ -41,8 +41,10 @@ def alert_env(monkeypatch):
     monkeypatch.setattr(notifier, "notify", fake_notify)
     monkeypatch.setattr(history_sync, "sync_kind", fake_sync_kind)
     monkeypatch.setattr(
-        history_sync, "_consecutive_failures", {db.TRADES: 0, db.CLOSED_PNL: 0}
+        history_sync, "_consecutive_failures",
+        {db.TRADES: 0, db.CLOSED_PNL: 0, db.TRANSACTIONS: 0},
     )
+    monkeypatch.setattr(history_sync, "_unsupported", set())
     return {"sent": sent, "state": state}
 
 
@@ -50,10 +52,11 @@ def test_sync_alerts_once_after_consecutive_failures(alert_env):
     for _ in range(5):  # keeps failing well past the threshold
         asyncio.run(history_sync.sync_all())
     warnings = [t for t in alert_env["sent"] if "failed" in t]
-    # One alert per collection (trades + closed-pnl), never repeated per run.
-    assert len(warnings) == 2
+    # One alert per collection, never repeated per run.
+    assert len(warnings) == 3
     assert any("trades" in t for t in warnings)
     assert any("closed-pnl" in t for t in warnings)
+    assert any("transactions" in t for t in warnings)
 
 
 def test_sync_recovery_notifies_and_resets(alert_env):
@@ -62,12 +65,12 @@ def test_sync_recovery_notifies_and_resets(alert_env):
     alert_env["state"]["fail"] = False
     asyncio.run(history_sync.sync_all())
     recoveries = [t for t in alert_env["sent"] if "recovered" in t]
-    assert len(recoveries) == 2
+    assert len(recoveries) == 3
     assert history_sync._consecutive_failures[db.TRADES] == 0
     # A later single failure starts counting from scratch — no immediate re-alert.
     alert_env["state"]["fail"] = True
     asyncio.run(history_sync.sync_all())
-    assert len([t for t in alert_env["sent"] if "failed" in t]) == 2  # unchanged
+    assert len([t for t in alert_env["sent"] if "failed" in t]) == 3  # unchanged
 
 
 def test_no_alert_below_threshold(alert_env):

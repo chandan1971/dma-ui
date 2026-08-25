@@ -202,6 +202,7 @@ def new_history_state(
     max_requests: int = _HISTORY_MAX_REQUESTS,
     min_window_ms: int = _HISTORY_MIN_WINDOW_MS,
     pace_s: float = 0.0,
+    page_limit: int = _HISTORY_PAGE_LIMIT,
 ) -> dict:
     """Shared per-fetch state for the windowed history machinery. The defaults
     reproduce the interactive dashboard behaviour; the background sync passes a
@@ -220,6 +221,11 @@ def new_history_state(
         "max_requests": max_requests,
         "min_window_ms": min_window_ms,
         "pace_s": pace_s,
+        # Per-endpoint page cap: saturation (= "a page came back full, so more
+        # may exist") must be detected against the limit actually REQUESTED —
+        # probing a 50-capped endpoint with limit=100 would make a full
+        # 50-record page look complete and silently drop everything past it.
+        "page_limit": page_limit,
     }
 
 
@@ -267,7 +273,7 @@ async def _fetch_time_range(path: str, base_params: dict, start_ms: int, end_ms:
         return []
 
     params = dict(base_params)
-    params["limit"] = str(_HISTORY_PAGE_LIMIT)
+    params["limit"] = str(state["page_limit"])
     params["startTime"] = str(start_ms)
     params["endTime"] = str(end_ms)
     payload = await _request("GET", path, params=params)
@@ -282,7 +288,7 @@ async def _fetch_time_range(path: str, base_params: dict, start_ms: int, end_ms:
             state["category"] = result.get("category")
 
     records = extract_list(payload)
-    if len(records) < _HISTORY_PAGE_LIMIT:
+    if len(records) < state["page_limit"]:
         return records  # whole window fit in one page
 
     # Saturated: there may be more records than one page can show. Split the
@@ -436,6 +442,26 @@ async def get_executions_window(start_ms: int, end_ms: int, state: dict) -> list
 async def get_closed_pnl_window(start_ms: int, end_ms: int, state: dict) -> list:
     return await _fetch_time_range(
         "/v5/position/closed-pnl", {"category": settings.CATEGORY}, start_ms, end_ms, state
+    )
+
+
+# The v5 transaction log caps a page at 50 records — HALF the 100-record cap of
+# executions/closed-pnl — so its windows must be fetched with page_limit=50 (see
+# new_history_state) or a full 50-record page would pass as unsaturated.
+TXN_PAGE_LIMIT = 50
+
+
+async def get_transaction_log_window(start_ms: int, end_ms: int, state: dict) -> list:
+    """One <=7-day window of the account transaction log — the ledger behind
+    every balance change (trades, trading fees, funding, transfers,
+    settlements). This endpoint is NOT in the DMA Postman collection: whether
+    the gateway proxies it is unknown until the first live call, so the
+    history sync probes it and disables the mirror on a 404 (see
+    app/history_sync.py); /healthz reports the probe's verdict."""
+    return await _fetch_time_range(
+        "/v5/account/transaction-log",
+        {"accountType": settings.ACCOUNT_TYPE, "category": settings.CATEGORY},
+        start_ms, end_ms, state,
     )
 
 

@@ -75,7 +75,7 @@ def fake_db(monkeypatch):
     semantics so the sync and read paths are exercised without a server.
     Returns the backing store: {kind: {_id: full stored doc}}."""
     store: dict[str, dict[str, dict]] = {
-        db_mod.TRADES: {}, db_mod.CLOSED_PNL: {},
+        db_mod.TRADES: {}, db_mod.CLOSED_PNL: {}, db_mod.TRANSACTIONS: {},
         db_mod.JOURNAL: {}, db_mod.JOURNAL_META: {},
         db_mod.AI_CONVERSATIONS: {},
     }
