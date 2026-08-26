@@ -4,7 +4,12 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>DMA Terminal — Sign in</title>
+  <meta name="theme-color" content="#0a0b10" />
   <link rel="stylesheet" href="/static/styles.css" />
+  <!-- Pre-paint theme stamp: sets data-theme on <html> before the
+       first frame so a light-theme user never sees a dark flash.
+       Must stay SYNCHRONOUS and stay in <head>. -->
+  <script src="/static/theme.js"></script>
 </head>
 <body class="login-body">
   <form id="login-form" class="login-card" autocomplete="off">

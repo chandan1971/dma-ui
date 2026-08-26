@@ -721,7 +721,10 @@ function rkRenderExposure() {
         const uplPct = r.value > 0 && r.upl != null ? (r.upl / r.value) * 100 : null;
         const heat = uplPct == null ? "flat" : uplPct >= 0 ? "pos" : "neg";
         const alpha = uplPct == null ? 0.1 : Math.min(0.42, 0.1 + Math.abs(uplPct) * 0.05);
-        const bg = heat === "pos" ? `rgba(0,201,141,${alpha.toFixed(2)})` : heat === "neg" ? `rgba(255,77,103,${alpha.toFixed(2)})` : "rgba(255,255,255,0.05)";
+        // The neutral tile uses the theme's veil channel (a hardcoded white
+        // wash disappears on the light theme); pos/neg keep the brand hues,
+        // which read on both backgrounds.
+        const bg = heat === "pos" ? `rgba(0,201,141,${alpha.toFixed(2)})` : heat === "neg" ? `rgba(255,77,103,${alpha.toFixed(2)})` : "rgba(var(--veil-rgb),0.06)";
         return `<div class="rk-map-tile" style="flex-basis:${Math.max(9, r.share).toFixed(1)}%;background:${bg}" title="${esc(r.symbol)} · ${rkPct(r.share, 1)} of gross">` +
           `<span class="sym mono">${esc(r.symbol)}</span>` +
           `<span class="mono">${rkPct(r.share, 0)}</span>` +

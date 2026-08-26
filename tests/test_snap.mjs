@@ -14,7 +14,10 @@ const src = fs.readFileSync(new URL("../app/static/charts.js", import.meta.url),
   "\n" + fs.readFileSync(new URL("../app/static/journal.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/ai.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/exec.js", import.meta.url), "utf8") +
-  "\n" + fs.readFileSync(new URL("../app/static/app.js", import.meta.url), "utf8");
+  "\n" + fs.readFileSync(new URL("../app/static/app.js", import.meta.url), "utf8") +
+  // theme.js ships as a separate <head> script (pre-paint), not part of the
+  // deferred bundle — appended here only so its pure core extracts.
+  "\n" + fs.readFileSync(new URL("../app/static/theme.js", import.meta.url), "utf8");
 
 function extractFn(name) {
   const start = src.search(new RegExp(`function ${name}\\s*\\(`));
@@ -1219,4 +1222,40 @@ assert.equal(SC.scFuzzyScore("BTCUSDT", ""), 0);
   assert.ok(elapsed < 1000, `200 rebuilds of a 1000-level book took ${elapsed}ms (must stay ≪ 16ms each)`);
 }
 
-console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core + journal-core + ai-core + exec-core regression tests passed");
+// ---------------------------------------------------------------------------
+// theme-core — the dark/light resolution rules. The DEFAULT MUST STAY DARK:
+// an unset or corrupt preference has to render the UI the app has always had,
+// never a half-applied light paint.
+// ---------------------------------------------------------------------------
+{
+  const T = new Function(
+    extractFn("themeFromStored") + "\n" + extractFn("nextTheme") +
+    "\nreturn { themeFromStored, nextTheme };"
+  )();
+
+  // Explicit preferences win regardless of what the OS reports.
+  assert.equal(T.themeFromStored("light", false), "light");
+  assert.equal(T.themeFromStored("light", true), "light");
+  assert.equal(T.themeFromStored("dark", true), "dark");
+  assert.equal(T.themeFromStored("dark", false), "dark");
+
+  // "system" follows the media query in both directions.
+  assert.equal(T.themeFromStored("system", true), "light");
+  assert.equal(T.themeFromStored("system", false), "dark");
+
+  // Anything else -> dark. Covers a fresh browser (null), a wiped value, and
+  // junk from another app/version sharing the origin.
+  for (const junk of [null, undefined, "", "Light", "LIGHT", "sepia", "0", "{}", 1]) {
+    assert.equal(T.themeFromStored(junk, false), "dark");
+    assert.equal(T.themeFromStored(junk, true), "dark",
+      "an unrecognized preference must NOT silently adopt the OS scheme");
+  }
+
+  // The button is a plain two-state flip on what is currently rendered.
+  assert.equal(T.nextTheme("dark"), "light");
+  assert.equal(T.nextTheme("light"), "dark");
+  // Flipping twice returns to the start (no third state to get stuck in).
+  assert.equal(T.nextTheme(T.nextTheme("dark")), "dark");
+}
+
+console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core + journal-core + ai-core + exec-core + theme-core regression tests passed");

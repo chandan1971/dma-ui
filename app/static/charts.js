@@ -1371,7 +1371,9 @@ function mcScreenshot(i) {
   const C = {
     bg: col("--surface", "#10121a"), text: col("--text", "#eef1f8"),
     muted: col("--muted", "#6e7891"), up: col("--pos", "#00c98d"),
-    down: col("--neg", "#ff4d67"), grid: "rgba(255,255,255,0.07)",
+    // Gridlines come from the theme token: a hardcoded white wash is
+    // invisible on the light theme's paper background.
+    down: col("--neg", "#ff4d67"), grid: col("--grid", "rgba(255,255,255,0.07)"),
   };
   const vis = rt.vis, dp = rt.dp;
   const W = 1280, H = 640, padL = 20, padR = 110, padT = 64, padB = 46, volH = 90, gap = 12;

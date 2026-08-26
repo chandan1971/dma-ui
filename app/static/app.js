@@ -4439,6 +4439,35 @@ function wirePrivacyToggle() {
 }
 
 // ---------------------------------------------------------------------------
+// Theme toggle (dark / light) — pure display state, next to the privacy eye.
+// theme.js (loaded in <head>) already stamped the stored theme before first
+// paint and owns persistence; this only wires the button and keeps its label
+// truthful. No re-render is needed anywhere: every surface is CSS tokens, the
+// live charts are class-styled SVG, and the one <canvas> (charts.js PNG
+// export) samples the palette at capture time. Modules that ever DO need to
+// repaint imperatively can listen for the window `themechange` event.
+// ---------------------------------------------------------------------------
+function wireThemeToggle() {
+  const btn = document.getElementById("theme-toggle");
+  if (!btn || !window.Theme) return;
+  const paint = () => {
+    const light = window.Theme.get() === "light";
+    // The label describes what the click DOES, not the current state.
+    const label = light ? "Switch to dark theme" : "Switch to light theme";
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    btn.setAttribute("aria-pressed", String(light));
+  };
+  paint();
+  btn.addEventListener("click", () => {
+    window.Theme.toggle();
+    paint();
+  });
+  // Keep the label right when the OS flips the theme under a "system" pref.
+  window.addEventListener("themechange", paint);
+}
+
+// ---------------------------------------------------------------------------
 // Currency display toggle (USDT / INR) — read-only display lens
 // ---------------------------------------------------------------------------
 function wireCurrencyToggle() {
@@ -7008,6 +7037,16 @@ function wireCommandPalette() {
       label: "Toggle privacy mode", hint: "display",
       run: () => { const b = document.getElementById("privacy-toggle"); if (b) b.click(); },
     });
+    acts.push({
+      label: "Toggle light / dark theme", hint: "display",
+      run: () => { const b = document.getElementById("theme-toggle"); if (b) b.click(); },
+    });
+    if (window.Theme) {
+      acts.push({
+        label: "Theme: follow system", hint: "display",
+        run: () => { window.Theme.set("system"); },
+      });
+    }
     document.querySelectorAll("#ccy-toggle button").forEach((b) => {
       acts.push({ label: `Display currency: ${b.dataset.ccy}`, hint: "display", run: () => b.click() });
     });
@@ -7461,6 +7500,7 @@ function wireTooltips() {
   wireKeysHelp(); // "?" shortcut reference
   wireTooltips(); // instant hover labels on icon-only buttons
   wirePrivacyToggle(); // restore saved privacy state BEFORE the first render (no flash)
+  wireThemeToggle(); // theme.js already painted it pre-paint; this wires the button
   wireCurrencyToggle(); // restore saved currency BEFORE the first render
   renderLoading(); // skeleton rows until the first snapshot lands
   updateSizingAvail();
