@@ -4263,21 +4263,18 @@ function onFundingActive() {
 }
 
 function fdWire() {
+  // Prefill defaults (still freely editable): the fund-tracking baseline
+  // date-time and the primary traded symbol.
   const since = document.getElementById("fd-since");
-  if (since && !since.value) since.value = fdLocalInputValue(Date.now() - 30 * 86_400_000);
+  if (since && !since.value) since.value = "2026-08-22T00:00";
+  const symbol = document.getElementById("fd-symbol");
+  if (symbol && !symbol.value) symbol.value = "SOLUSDT";
   const apply = () => fdLoad();
   document.getElementById("fd-apply")?.addEventListener("click", apply);
   document.getElementById("fd-symbol")?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") apply();
   });
   since?.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
-}
-
-// datetime-local wants "YYYY-MM-DDTHH:mm" in LOCAL time (no timezone suffix).
-function fdLocalInputValue(ms) {
-  const d = new Date(ms);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 async function fdLoad() {
