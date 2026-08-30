@@ -160,6 +160,22 @@ class Settings:
             os.environ.get("SCANNER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
         )
 
+        # --- Overall unrealised-PnL tracker (READ-ONLY; needs Redis) ---
+        # A background task (app/upnl.py) samples the account's total
+        # unrealised PnL — ONE signed read-only positions request per interval
+        # regardless of open browser tabs — and persists the series in Redis
+        # (Railway's Redis service). OFF unless REDIS_URL is set; the PnL tab
+        # then shows a clear "not configured" state. Retention is budgeted for
+        # Railway's 500 MB Redis cap (see app/upnl.py's docstring math).
+        self.REDIS_URL: str = os.environ.get("REDIS_URL", "")
+        # Floored at 2s: each sample is a signed exchange read, so a typo'd
+        # sub-second interval must never hammer the venue.
+        self.UPNL_SAMPLE_INTERVAL: float = max(2.0, _float_env("UPNL_SAMPLE_INTERVAL", 5.0))
+        # Kill switch: UPNL_ENABLED=0 starts no sampler even with REDIS_URL set.
+        self.UPNL_ENABLED: bool = (
+            os.environ.get("UPNL_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+        )
+
         # --- Execution alerts via Telegram (READ-ONLY, opt-in) ---
         # A background watcher (app/notifier.py) polls the account's executions
         # and pushes a Telegram message on each fill / TP-SL / liquidation. It is

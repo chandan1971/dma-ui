@@ -1028,6 +1028,9 @@ function renderDashboard(d) {
   // surfaces (the compact dashboard panel + the Risk tab) all feed off this
   // one snapshot — no extra requests.
   rkIngest(d);
+  // PnL tab (pnl.js): the live "current unrealised PnL" value rides the same
+  // snapshot; the history series itself is fetched from /api/upnl on entry.
+  pnlIngest(d);
   // Execution workspace (exec.js): quick-actions context, ladder markers and
   // the ticket preview all ride the same snapshot.
   exIngest();
@@ -2624,6 +2627,10 @@ function wireTabs() {
     // is managed separately by scEnsureAlertTimer).
     if (name !== "scanner") clearInterval(_scTimer);
     if (name === "scanner") onScannerActive();
+    // PnL tab (pnl.js): refetch its Redis-backed series only while visible
+    // (the live current value rides the shared WS snapshot regardless).
+    if (name !== "pnl") clearInterval(_pnTimer);
+    if (name === "pnl") onPnlActive();
     // The "history" pane is the Trading Journal (journal.js) — the pane id is
     // kept for workspace-state continuity with saved layouts.
     if (name === "history") onJournalActive();
@@ -6277,7 +6284,7 @@ const WS_MAX = 20;
 // Allowlists for sanitizing stored/imported state (one-line consts so the
 // test harness can extract them alongside the functions).
 const WS_PANEL_IDS = ["risk", "positions", "orders", "charts", "exec", "token", "quick", "ticket", "book", "rk-head", "rk-exposure", "rk-conc", "rk-liq", "rk-margin", "rk-positions", "rk-daily", "rk-timeline", "rk-history"];
-const WS_TABS = ["dashboard", "risk", "scanner", "markets", "history", "ai", "account", "tools"];
+const WS_TABS = ["dashboard", "risk", "pnl", "scanner", "markets", "history", "ai", "account", "tools"];
 const WS_SYMBOL_RE = /^[A-Z0-9]{1,20}$/;
 
 function wsId() {
@@ -7491,6 +7498,7 @@ function wireTooltips() {
   wireScanner(); // Market scanner (loads _scDoc BEFORE workspaces apply their saved view)
   wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
   wireRisk(); // risk command center (feeds off the shared dashboard snapshot)
+  wirePnl(); // unrealised-PnL history tab (Redis-backed series via /api/upnl)
   wireJournal(); // trading journal (loads on tab entry; BEFORE workspaces apply their saved view)
   wireAI(); // AI coach (read-only intelligence layer; loads on tab entry)
   wireExec(); // execution workspace (ladder/previews/quick actions on the Trade tab)

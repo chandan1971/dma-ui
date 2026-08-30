@@ -51,6 +51,7 @@ from . import (
     notifier,
     scanner,
     signer,
+    upnl,
 )
 from .config import settings
 
@@ -118,12 +119,15 @@ async def lifespan(app: FastAPI):
     # Background market-scanner sampler: ONE shared ticker poll per interval
     # feeds /api/scanner for every viewer (read-only; no-op when disabled).
     scanner_task = asyncio.create_task(scanner.run_sampler())
+    # Background unrealised-PnL sampler: one positions read per interval,
+    # persisted to Redis, feeds /api/upnl (no-op when REDIS_URL is unset).
+    upnl_task = asyncio.create_task(upnl.run_sampler())
     try:
         yield
     finally:
         # The WS broadcaster is started lazily on the first client (so tests and
         # idle deploys never spin it); include it here if it is running.
-        tasks = [db_init, watcher, syncer, scanner_task]
+        tasks = [db_init, watcher, syncer, scanner_task, upnl_task]
         if _ws_broadcast_task is not None:
             tasks.append(_ws_broadcast_task)
         for task in tasks:
@@ -137,6 +141,7 @@ async def lifespan(app: FastAPI):
         await market_data.aclose()
         await notifier.aclose()
         await ai_providers.aclose()
+        await upnl.aclose()
         await db.aclose()
 
 
@@ -582,6 +587,12 @@ def healthz():
                 round((now_ms - scanner.last_sample_ms()) / 1000)
                 if scanner.last_sample_ms() else None
             ),
+            # Seconds since the unrealised-PnL tracker last persisted a sample
+            # to Redis (null until its first sample, or forever when disabled).
+            "upnlAgeSeconds": (
+                round((now_ms - upnl.last_sample_ms()) / 1000)
+                if upnl.last_sample_ms() else None
+            ),
         },
     )
 
@@ -959,6 +970,19 @@ async def api_server_time(user: dict = Depends(current_user)):
 @app.get("/api/tickers")
 async def api_tickers(symbol: str | None = None, user: dict = Depends(current_user)):
     return await dma_client.get_tickers(_norm_symbol_opt(symbol))
+
+
+@app.get("/api/upnl")
+async def api_upnl(range: str = "6h", user: dict = Depends(current_user)):
+    """Overall unrealised-PnL history from Redis (sampled by app/upnl.py's
+    background task) — this handler performs no upstream exchange call, so any
+    number of PnL tabs cost the exchange nothing beyond the one sampler."""
+    if range not in upnl.RANGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid range; expected one of {', '.join(upnl.RANGES)}",
+        )
+    return await upnl.range_response(range)
 
 
 @app.get("/api/scanner")

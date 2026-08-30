@@ -70,6 +70,19 @@ All credentials live in environment variables.
   alerts and every other scanner control are display-only and can never place,
   modify or cancel an order. Sorting, filters, preset, card layout, selection
   and scroll position are remembered **per workspace**.
+- 📈 **Unrealised-PnL history** (the *PnL* tab): a background sampler reads the
+  account's positions every `UPNL_SAMPLE_INTERVAL` (default 5 s) — **one**
+  signed read-only request per interval no matter how many tabs are open — sums
+  the total unrealised PnL and persists the series in **Redis** (Railway's
+  Redis service via `REDIS_URL`). The tab charts it over 1H/6H/1D/7D/30D/ALL
+  with a zero-split green/red area, per-bucket hi/lo band and crosshair
+  tooltip, plus stat cards for the current value (live off the shared WS
+  snapshot), the window's max unrealised PnL / max unrealised loss (computed
+  server-side over FULL-resolution data, never the downsampled drawing) and
+  the all-time peak/trough. Retention is budgeted for Railway's 500 MB Redis:
+  raw 5s samples for 7 days, 1-min OHLC rollups for 60 days, 1-hour rollups
+  for 2 years (~22 MB at full retention, `MAXLEN`-trimmed on every write). A
+  Redis or exchange outage leaves an honest gap — nothing is interpolated.
 - 🗄️ **History tab backed by MongoDB**: a background sync mirrors executions and
   closed PnL into Mongo every minute (cursor-free, time-windowed); the UI reads
   only the mirror, with range presets / custom dates / overall, an equity curve,
@@ -105,12 +118,14 @@ app/
   notifier.py      Telegram execution alerts + operational alerts (opt-in)
   scanner.py       market-scanner engine: shared ticker sampler + rolling
                    history + metric providers (serves /api/scanner from memory)
+  upnl.py          unrealised-PnL tracker: positions sampler -> Redis streams
+                   (raw + 1m/1h rollups + all-time extremes; serves /api/upnl)
   market_data.py   public kline proxy for the charts (unsigned; static
                    allowlist + scanner-observed live universe)
   static/          login.html, index.html, app.js, charts.js, risk.js,
-                   styles.css (charts.js = multi-chart workspace, risk.js =
-                   risk command center; both feed off shared data, no extra
-                   polling)
+                   pnl.js, styles.css (charts.js = multi-chart workspace,
+                   risk.js = risk command center, pnl.js = unrealised-PnL
+                   history tab; all feed off shared data, no extra polling)
 tests/             pytest suite (+ tests/test_snap.mjs money-math regression)
 requirements.txt / requirements-dev.txt
 Procfile / railway.json   start command for Railway
@@ -135,8 +150,10 @@ Procfile / railway.json   start command for Railway
    - optional: `DMA_BASE_URL`, `CATEGORY`, `SETTLE_COIN`, `ACCOUNT_TYPE`,
      `POLL_INTERVAL`, `INR_RATE`, `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`,
      `SYNC_INTERVAL_SECONDS`, `SYNC_BACKFILL_DAYS`, `TRUSTED_PROXY_HOPS`,
-     `CHART_SYMBOLS`, `SCANNER_SAMPLE_INTERVAL`, `SCANNER_ENABLED` — every
-     variable is documented in `.env.example`
+     `CHART_SYMBOLS`, `SCANNER_SAMPLE_INTERVAL`, `SCANNER_ENABLED`,
+     `REDIS_URL` (= `${{Redis.REDIS_URL}}` after adding Railway's Redis
+     service; enables the PnL tab's history), `UPNL_SAMPLE_INTERVAL`,
+     `UPNL_ENABLED` — every variable is documented in `.env.example`
 4. Railway gives the service a public URL. Open it → log in.
 
 > `$PORT` is provided by Railway automatically; the start command already
@@ -154,7 +171,10 @@ mirror last completed a sync (normally under ~2× `SYNC_INTERVAL_SECONDS`; a
 climbing value means the sync is wedged and the History tab is going stale) —
 and `scannerAgeSeconds` (seconds since the market scanner's last ticker
 sample; normally ≈ `SCANNER_SAMPLE_INTERVAL`, null before the first sample or
-when the scanner is disabled).
+when the scanner is disabled), and `upnlAgeSeconds` (seconds since the
+unrealised-PnL tracker last persisted a sample to Redis; normally ≈
+`UPNL_SAMPLE_INTERVAL`, null before the first sample or when `REDIS_URL` is
+unset).
 
 ### Running the tests
 

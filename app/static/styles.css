@@ -2685,3 +2685,28 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 }
 .fd-note { padding: 8px 14px; font-size: 11px; }
 #fd-table td { font-variant-numeric: tabular-nums; }
+
+/* ===== PnL tab (unrealised-PnL history) ===== */
+.pn-stats {
+  display: flex; align-items: stretch; gap: 18px; flex-wrap: wrap;
+  padding: 12px 14px; border-bottom: 1px solid var(--border);
+}
+.pn-ranges { width: auto; }
+.pn-ranges button { flex: 0 0 auto; padding: 4px 11px; font-size: 11px; min-width: 40px; }
+.pn-chart-wrap { position: relative; padding: 10px 14px 2px; }
+.pn-chart svg { display: block; max-width: 100%; }
+.pn-grid { stroke: var(--border); stroke-width: 1; opacity: 0.55; }
+.pn-zero { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 4; opacity: 0.8; }
+.pn-band { fill: var(--muted); fill-opacity: 0.10; }
+.pn-axis { fill: var(--muted); font-size: 10px; font-family: var(--mono); }
+.pn-cross { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0.9; }
+.pn-cross-dot { stroke: var(--bg); stroke-width: 1.5; }
+.pn-tip {
+  position: absolute; pointer-events: none; z-index: 5;
+  display: flex; gap: 8px; align-items: baseline; white-space: nowrap;
+  padding: 5px 9px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--raised); box-shadow: var(--shadow-pop);
+  font-size: 11px; font-family: var(--mono); font-variant-numeric: tabular-nums;
+}
+.pn-tip b { font-weight: 600; color: var(--text-2); }
+.pn-note { padding: 8px 14px 12px; font-size: 11px; }

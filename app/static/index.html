@@ -34,6 +34,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="12" y1="8" x2="12" y2="12.5"/><circle cx="12" cy="15.5" r="0.5"/></svg>
           <span>Risk</span>
         </button>
+        <button class="tab" data-tab="pnl" role="tab" id="tab-pnl" aria-controls="panel-pnl" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="2 12 6.5 12 9.5 5 14.5 19 17.5 12 22 12"/></svg>
+          <span>PnL</span>
+        </button>
         <button class="tab" data-tab="scanner" role="tab" id="tab-scanner" aria-controls="panel-scanner" aria-selected="false" tabindex="-1">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="0.5"/><line x1="12" y1="3" x2="12" y2="7.5"/><line x1="16" y1="8" x2="19.5" y2="4.5"/></svg>
           <span>Scan</span>
@@ -520,6 +524,61 @@
           <section class="panel" data-wpanel="rk-history">
             <div class="panel-head"><h2>Risk History</h2><span class="muted">session-local series</span></div>
             <div id="rk-history-body" class="rk-body"></div>
+          </section>
+        </div>
+
+        <!-- ============ UNREALISED PNL ============ -->
+        <!-- Overall unrealised-PnL history: the backend samples Σ unrealisedPnl
+             every ~5s and persists it in Redis (app/upnl.py); this pane reads
+             /api/upnl (a local Redis read — zero upstream calls per tab) and
+             the live current value rides the shared WS snapshot. READ-ONLY:
+             nothing in this pane can place, modify or cancel an order. -->
+        <div class="pane" data-pane="pnl" id="panel-pnl" role="tabpanel" aria-labelledby="tab-pnl" hidden>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Unrealised PnL</h2>
+              <span id="pn-status" class="muted" role="status" aria-live="polite"></span>
+              <div class="panel-head-actions">
+                <div class="segment pn-ranges" id="pn-ranges" role="group" aria-label="History range">
+                  <button type="button" data-range="1h" aria-pressed="false">1H</button>
+                  <button type="button" data-range="6h" aria-pressed="false">6H</button>
+                  <button type="button" data-range="24h" aria-pressed="false">1D</button>
+                  <button type="button" data-range="7d" aria-pressed="false">7D</button>
+                  <button type="button" data-range="30d" aria-pressed="false">30D</button>
+                  <button type="button" data-range="all" aria-pressed="false">ALL</button>
+                </div>
+              </div>
+            </div>
+            <div class="pn-stats" role="group" aria-label="Unrealised PnL statistics">
+              <div class="stat stat-primary">
+                <span class="stat-label">Current unrealised PnL</span>
+                <span class="stat-value priv" id="pn-cur">—</span>
+                <span class="stat-sub" id="pn-cur-sub">waiting for data…</span>
+              </div>
+              <div class="stat-div"></div>
+              <div class="stat">
+                <span class="stat-label" id="pn-max-label">Max unrealised PnL</span>
+                <span class="stat-value priv" id="pn-max">—</span>
+                <span class="stat-sub" id="pn-max-sub"></span>
+              </div>
+              <div class="stat-div"></div>
+              <div class="stat">
+                <span class="stat-label" id="pn-min-label">Max unrealised loss</span>
+                <span class="stat-value priv" id="pn-min">—</span>
+                <span class="stat-sub" id="pn-min-sub"></span>
+              </div>
+              <div class="stat-div"></div>
+              <div class="stat">
+                <span class="stat-label" title="Highest and lowest total unrealised PnL ever recorded by the tracker">All-time peak / trough</span>
+                <span class="stat-value priv" id="pn-ext">—</span>
+                <span class="stat-sub" id="pn-ext-sub"></span>
+              </div>
+            </div>
+            <div class="pn-chart-wrap">
+              <div id="pn-chart" class="pn-chart"></div>
+              <div id="pn-tip" class="pn-tip" hidden></div>
+            </div>
+            <div id="pn-note" class="muted pn-note"></div>
           </section>
         </div>
 
@@ -1081,10 +1140,12 @@
   </div>
 
   <!-- Module scripts first (charts.js = multi-chart, risk.js = risk system,
-       journal.js = trading journal, ai.js = AI coach); app.js boots them and
-       feeds risk.js every live snapshot. -->
+       pnl.js = unrealised-PnL history, journal.js = trading journal,
+       ai.js = AI coach); app.js boots them and feeds risk.js + pnl.js every
+       live snapshot. -->
   <script src="/static/charts.js"></script>
   <script src="/static/risk.js"></script>
+  <script src="/static/pnl.js"></script>
   <script src="/static/journal.js"></script>
   <script src="/static/ai.js"></script>
   <script src="/static/exec.js"></script>

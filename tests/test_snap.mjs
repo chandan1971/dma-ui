@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 // rkSanitizeViewState / jnSanitizeViewState / aiSanitizeViewState) extract.
 const src = fs.readFileSync(new URL("../app/static/charts.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/risk.js", import.meta.url), "utf8") +
+  "\n" + fs.readFileSync(new URL("../app/static/pnl.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/journal.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/ai.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/exec.js", import.meta.url), "utf8") +
@@ -1258,4 +1259,39 @@ assert.equal(SC.scFuzzyScore("BTCUSDT", ""), 0);
   assert.equal(T.nextTheme(T.nextTheme("dark")), "dark");
 }
 
-console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core + journal-core + ai-core + exec-core + theme-core regression tests passed");
+// ---------------------------------------------------------------------------
+// pnl-core (pnl.js) — range sanitizing + axis-tick math for the uPnL chart.
+// ---------------------------------------------------------------------------
+{
+  const P = new Function(
+    `const PN_RANGES = ["1h", "6h", "24h", "7d", "30d", "all"];\n` +
+    extractFn("pnSanitizeRange") + "\n" + extractFn("pnNiceTicks") +
+    "\n" + extractFn("pnTickDecimals") +
+    "\nreturn { pnSanitizeRange, pnNiceTicks, pnTickDecimals };"
+  )();
+
+  // Only known ranges survive; junk (old keys, other apps' values) -> default.
+  assert.equal(P.pnSanitizeRange("24h"), "24h");
+  assert.equal(P.pnSanitizeRange("all"), "all");
+  for (const junk of [null, undefined, "", "2h", "1H", "ALL", 42, "{}"]) {
+    assert.equal(P.pnSanitizeRange(junk), "6h");
+  }
+
+  // Ticks: cover the domain, ordered, include an exact 0 when 0 is in range
+  // (the zero gridline must pair with the chart's green/red split).
+  const ticks = P.pnNiceTicks(-37.4, 82.1, 5);
+  assert.ok(ticks.length >= 2 && ticks.length <= 9);
+  assert.ok(ticks.includes(0), "zero must be an exact tick when in range");
+  assert.ok(ticks[0] >= -37.4 - 1e-9 && ticks[ticks.length - 1] <= 82.1 + 1e-9);
+  for (let i = 1; i < ticks.length; i++) assert.ok(ticks[i] > ticks[i - 1]);
+  // A flat series must still produce ticks (the domain is padded, not divided by 0).
+  assert.ok(P.pnNiceTicks(5, 5, 5).length >= 2);
+  assert.deepEqual(P.pnNiceTicks(NaN, 10, 5), []);
+
+  // Label precision follows the step size.
+  assert.equal(P.pnTickDecimals(50), 0);
+  assert.equal(P.pnTickDecimals(2.5), 1);
+  assert.equal(P.pnTickDecimals(0.25), 2);
+}
+
+console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core + journal-core + ai-core + exec-core + theme-core + pnl-core regression tests passed");

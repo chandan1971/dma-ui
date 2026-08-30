@@ -5,4 +5,5 @@ pynacl==1.5.0
 itsdangerous==2.2.0
 python-multipart==0.0.20
 pymongo==4.17.0
+redis==8.1.0
 anthropic==0.116.0
