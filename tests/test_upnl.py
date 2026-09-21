@@ -126,6 +126,23 @@ def test_downsample_bounds_and_extreme_preservation():
     assert upnl.downsample(short, 720) == short
 
 
+def test_sampler_backs_off_on_upstream_rate_limit_ban(monkeypatch):
+    """The gateway's ban shape verbatim from the Sep '26 incidents (HTTP 403,
+    'Access too frequent…') must land in the rate-limit branch: an extra
+    cooldown instead of another poke 5s later — hammering a banned gateway is
+    exactly what keeps the ban alive."""
+    from app import dma_client
+
+    async def banned():
+        raise dma_client.DMAError(
+            403, {"error": "Access too frequent. Please try again in 5 minutes."})
+    monkeypatch.setattr(upnl.dma_client, "get_positions", banned)
+
+    cooldown = run(upnl._sample_once())
+    assert cooldown == settings.UPNL_SAMPLE_INTERVAL * upnl._RATE_LIMIT_EXTRA_CYCLES
+    assert cooldown > 0
+
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------

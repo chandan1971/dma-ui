@@ -47,7 +47,10 @@ def is_rate_limit(exc: Exception) -> bool:
     if exc.status == 429 or exc.ret_code in _RATE_LIMIT_RET_CODES:
         return True
     detail = str(exc.detail).lower()
-    return "too many" in detail or "rate limit" in detail
+    # "too frequent" is the gateway's hard-ban copy ("Access too frequent.
+    # Please try again in 5 minutes.", HTTP 403) — the one shape that most
+    # needs the back-off, and the one this check silently missed for weeks.
+    return "too many" in detail or "rate limit" in detail or "too frequent" in detail
 
 
 # One shared async client reused across all calls (connection pooling / keep-alive)

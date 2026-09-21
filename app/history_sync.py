@@ -22,7 +22,11 @@ Crash-safety model (the invariants everything below leans on):
     next is fetched, so the stored data is always a contiguous prefix of the
     planned range. The resume point (watermark) is derived from the DATA
     itself — max tsMs in the collection — so it can never point past a gap:
-    a crashed/aborted run simply leaves less data, never wrong state.
+    a crashed/aborted run simply leaves less data, never wrong state. Once a
+    run has COMPLETED (covered through `now`), later resumes start at that
+    run's end bound minus the overlap instead of a possibly-stale watermark:
+    completion certifies coverage, so re-walking back to a watermark that
+    stopped moving (no new records) would only re-fetch immutable ranges.
   * Re-running is idempotent: `_id` is the record's natural identity (execId /
     orderId:updatedTime) and writes are ReplaceOne upserts, so overlap and
     repeats are free. Each run restarts two hours before the watermark to
@@ -224,7 +228,7 @@ def last_synced_ms(kind: str):
 # mapped (the primary classification is the NUMERIC ret_code below — strings
 # are brittle against upstream copy changes).
 _RETRYABLE_HINTS = (
-    "too many", "rate limit", "timeout", "timed out",
+    "too many", "rate limit", "too frequent", "timeout", "timed out",
     "system busy", "system error", "service unavailable",
 )
 
@@ -280,6 +284,22 @@ async def sync_kind(kind: str) -> dict:
         start_ms, mode = floor_ms, "cold-start backfill"
     else:
         start_ms, mode = max(watermark - _OVERLAP_MS, floor_ms), "resume"
+        last_run_ms = _last_synced_ms.get(kind)
+        if last_run_ms is not None:
+            # A completed run certifies coverage through its end bound, so a
+            # later resume only needs the overlap's late-visibility budget
+            # behind THAT — never the full span back to the watermark. The
+            # watermark stops moving whenever no new records arrive (weeks
+            # without a closed trade), and re-walking every window back to it
+            # on every run burned 5 requests/minute against data that cannot
+            # change — the standing load behind the Sep '26 upstream
+            # rate-limit bursts. Records surfacing later than the overlap
+            # remain the hourly deep rescan's job, exactly as they already
+            # were for a moving watermark. Crash-safe: the stamp is only
+            # written by runs that reached `now`, and the first run after a
+            # boot (stamp None) still walks from the watermark, healing any
+            # downtime gap.
+            start_ms = max(start_ms, last_run_ms - _OVERLAP_MS)
         if (
             now_ms - _last_deep_rescan_ms.get(kind, 0) >= _DEEP_RESCAN_INTERVAL_MS
             and deep_start_ms < start_ms
@@ -384,6 +404,16 @@ async def sync_kind(kind: str) -> dict:
 _FAILURES_BEFORE_ALERT = 3
 _consecutive_failures: dict = {db.TRADES: 0, db.CLOSED_PNL: 0, db.TRANSACTIONS: 0}
 
+# A rate limit that survives the in-run retry ladder is a ban measured in
+# minutes ("Access too frequent. Please try again in 5 minutes."), not a blip:
+# keeping the 1-minute cadence pokes the throttled gateway and extends the
+# ban. One such failure pauses ALL kinds for this long (matching the ban's own
+# stated duration). Skipped runs are deliberate, not failures — a single burst
+# never pages Telegram; sustained throttling still does, after
+# _FAILURES_BEFORE_ALERT failed attempts spaced a cooldown apart (~10+ min).
+_RATE_LIMIT_COOLDOWN_S = 300.0
+_rate_limited_until_ms = 0.0
+
 
 async def sync_all() -> None:
     """One scheduled run: each collection independently, under the single-flight
@@ -392,7 +422,15 @@ async def sync_all() -> None:
     run simply resumes. A probational kind whose endpoint the gateway rejects
     as nonexistent (404/405) is disabled for the process lifetime — that is a
     capability verdict, not an incident."""
+    global _rate_limited_until_ms
     async with _sync_lock:
+        if time.time() * 1000 < _rate_limited_until_ms:
+            logger.info(
+                "history sync: upstream rate-limit cooldown active (%.0fs left) "
+                "— skipping this run",
+                (_rate_limited_until_ms - time.time() * 1000) / 1000,
+            )
+            return
         for kind in (db.TRADES, db.CLOSED_PNL, db.TRANSACTIONS):
             if kind in _unsupported:
                 continue
@@ -418,11 +456,27 @@ async def sync_all() -> None:
                         label, exc.status, label,
                     )
                     continue
-                logger.exception(
-                    "history sync %s: run failed; data is intact and the next "
-                    "run resumes from the last stored record",
-                    label,
-                )
+                throttled = isinstance(exc, dma_client.DMAError) and \
+                    dma_client.is_rate_limit(exc)
+                if throttled:
+                    _rate_limited_until_ms = (
+                        time.time() * 1000 + _RATE_LIMIT_COOLDOWN_S * 1000
+                    )
+                    # warning, not exception: the ban is an upstream state, not
+                    # a code path worth a traceback every occurrence.
+                    logger.warning(
+                        "history sync %s: upstream rate limit persisted through "
+                        "retries (%s) — pausing all history sync for %.0fs; data "
+                        "is intact and the next run resumes from the last stored "
+                        "record",
+                        label, exc, _RATE_LIMIT_COOLDOWN_S,
+                    )
+                else:
+                    logger.exception(
+                        "history sync %s: run failed; data is intact and the next "
+                        "run resumes from the last stored record",
+                        label,
+                    )
                 _consecutive_failures[kind] += 1
                 # == (not >=): alert exactly once per wedge, not every minute.
                 if _consecutive_failures[kind] == _FAILURES_BEFORE_ALERT:
@@ -431,6 +485,10 @@ async def sync_all() -> None:
                         f"{_FAILURES_BEFORE_ALERT} runs in a row — the History tab "
                         "is going stale. Check the deploy logs."
                     )
+                if throttled:
+                    # The remaining kinds share the throttled gateway — hitting
+                    # them right now is exactly the traffic the ban punishes.
+                    break
             else:
                 if _consecutive_failures[kind] >= _FAILURES_BEFORE_ALERT:
                     await notifier.notify(

@@ -69,6 +69,7 @@ def _install(monkeypatch, trades=(), pnls=(), backfill_days=BACKFILL_DAYS):
     monkeypatch.setattr(history_sync, "_unsupported", set())
     monkeypatch.setattr(history_sync, "_consecutive_failures",
                         {db.TRADES: 0, db.CLOSED_PNL: 0, db.TRANSACTIONS: 0})
+    monkeypatch.setattr(history_sync, "_rate_limited_until_ms", 0.0)
 
     calls: list[tuple[str, int, int]] = []
 
@@ -106,6 +107,9 @@ W2_TS = FLOOR_MS + 8 * DAY_MS
 W3_TS = FIXED_NOW_MS - 1_000
 THREE_FILLS = [_fill("e1", W1_TS), _fill("e2", W2_TS), _fill("e3", W3_TS)]
 THREE_PNLS = [_pnl("o1", W1_TS), _pnl("o2", W2_TS), _pnl("o3", W3_TS)]
+
+# The gateway's rate-limit ban body, verbatim from the Sep '26 incidents.
+RATE_LIMIT_BODY = {"error": "Access too frequent. Please try again in 5 minutes."}
 
 
 def test_cold_start_walks_ascending_7day_windows_and_stores_both_kinds(monkeypatch, fake_db):
@@ -219,9 +223,93 @@ def test_is_rate_limit_classification():
     assert dma_client.is_rate_limit(dma_client.DMAError(429, "x")) is True
     assert dma_client.is_rate_limit(dma_client.DMAError(400, "x", ret_code=10006)) is True
     assert dma_client.is_rate_limit(dma_client.DMAError(400, "Rate limit hit")) is True
+    # The gateway's hard-ban shape exactly as seen in production (Sep '26):
+    # HTTP 403, a JSON body with no retCode, and "too frequent" copy that the
+    # old classifier missed — which kept every poller's backoff from engaging.
+    assert dma_client.is_rate_limit(dma_client.DMAError(403, RATE_LIMIT_BODY)) is True
     assert dma_client.is_rate_limit(dma_client.DMAError(400, "params error")) is False
     assert dma_client.is_rate_limit(dma_client.DMAError(502, "network")) is False
     assert dma_client.is_rate_limit(RuntimeError("boom")) is False
+
+
+def test_rate_limited_run_pauses_all_sync_without_paging(monkeypatch, fake_db):
+    """A rate limit that survives the retry ladder pauses EVERY kind for the
+    cooldown (poking a banned gateway extends the ban), makes zero upstream
+    requests meanwhile, and a single burst never pages Telegram."""
+    calls, handlers = _install(monkeypatch, trades=[_fill("e1", FIXED_NOW_MS - 1_000)],
+                               backfill_days=5)
+    monkeypatch.setattr(history_sync, "_RETRY_ATTEMPTS", 2)
+    notes = []
+
+    async def fake_notify(text):
+        notes.append(text)
+    monkeypatch.setattr(history_sync.notifier, "notify", fake_notify)
+    default = handlers["fn"]
+
+    handlers["fn"] = lambda path, start, end: _Resp(403, RATE_LIMIT_BODY)
+    asyncio.run(history_sync.sync_all())
+
+    assert len(calls) == 2, \
+        "one retry ladder for trades; closed-pnl/transactions must not be attempted"
+    assert history_sync._rate_limited_until_ms == \
+        FIXED_NOW_MS + history_sync._RATE_LIMIT_COOLDOWN_S * 1000
+    assert notes == [], "a single throttled burst must not page Telegram"
+
+    asyncio.run(history_sync.sync_all())
+    assert len(calls) == 2, "runs inside the cooldown make NO upstream requests"
+
+    # Clock past the cooldown, gateway healed -> normal run, counter reset.
+    later = FIXED_NOW_MS + history_sync._RATE_LIMIT_COOLDOWN_S * 1000 + 60_000
+    monkeypatch.setattr(history_sync.time, "time", lambda: later / 1000)
+    handlers["fn"] = default
+    asyncio.run(history_sync.sync_all())
+    assert "e1" in fake_db[db.TRADES]
+    assert history_sync._consecutive_failures[db.TRADES] == 0
+    assert notes == [], "recovery below the alert threshold stays silent"
+
+
+def test_sustained_throttling_pages_exactly_once(monkeypatch, fake_db):
+    """Rate-limit failures still count toward the wedge alert: with the
+    cooldown between attempts, the third failed attempt (~10+ min of sustained
+    throttling) pages once — bursts stay silent, real outages do not."""
+    calls, handlers = _install(monkeypatch, backfill_days=5)
+    monkeypatch.setattr(history_sync, "_RETRY_ATTEMPTS", 1)
+    notes = []
+
+    async def fake_notify(text):
+        notes.append(text)
+    monkeypatch.setattr(history_sync.notifier, "notify", fake_notify)
+    handlers["fn"] = lambda path, start, end: _Resp(403, RATE_LIMIT_BODY)
+
+    now = FIXED_NOW_MS
+    for _ in range(history_sync._FAILURES_BEFORE_ALERT):
+        monkeypatch.setattr(history_sync.time, "time", lambda t=now: t / 1000)
+        asyncio.run(history_sync.sync_all())
+        now += int(history_sync._RATE_LIMIT_COOLDOWN_S * 1000) + 60_000
+
+    assert len(notes) == 1 and "trades" in notes[0]
+    # Still throttled afterwards: no duplicate page.
+    monkeypatch.setattr(history_sync.time, "time", lambda t=now: t / 1000)
+    asyncio.run(history_sync.sync_all())
+    assert len(notes) == 1
+
+
+def test_resume_never_rewalks_behind_a_completed_run(monkeypatch, fake_db):
+    """A watermark that stopped moving (weeks without a closed trade) must not
+    make every 1-minute resume re-walk multi-week windows — that standing load
+    fed the Sep '26 rate-limit bans. A completed run certifies coverage
+    through its end bound, so resume needs only the overlap behind THAT."""
+    calls, _ = _install(monkeypatch, trades=THREE_FILLS)
+    stale_ts = FIXED_NOW_MS - 15 * DAY_MS
+    fake_db[db.TRADES]["seed"] = {"_id": "seed", "tsMs": stale_ts, "execId": "seed"}
+    history_sync._last_synced_ms[db.TRADES] = FIXED_NOW_MS - 60_000  # ran a minute ago
+
+    asyncio.run(history_sync.sync_kind(db.TRADES))
+
+    exec_calls = _exec_calls(calls)
+    assert len(exec_calls) == 1, "a 2h tail is one window, not one per stale week"
+    assert exec_calls[0][1] == FIXED_NOW_MS - 60_000 - history_sync._OVERLAP_MS, \
+        "resume starts at last-completed-run end minus overlap, not at the watermark"
 
 
 def test_budget_exhaustion_stops_run_and_next_run_completes(monkeypatch, fake_db):
