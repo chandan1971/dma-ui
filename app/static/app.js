@@ -2631,6 +2631,9 @@ function wireTabs() {
     // (the live current value rides the shared WS snapshot regardless).
     if (name !== "pnl") clearInterval(_pnTimer);
     if (name === "pnl") onPnlActive();
+    // Bot tab (strategy.js): poll the strategy trade ledger only while visible.
+    if (name !== "strategy") clearInterval(_stTimer);
+    if (name === "strategy") onStrategyActive();
     // The "history" pane is the Trading Journal (journal.js) — the pane id is
     // kept for workspace-state continuity with saved layouts.
     if (name === "history") onJournalActive();
@@ -6284,7 +6287,7 @@ const WS_MAX = 20;
 // Allowlists for sanitizing stored/imported state (one-line consts so the
 // test harness can extract them alongside the functions).
 const WS_PANEL_IDS = ["risk", "positions", "orders", "charts", "exec", "token", "quick", "ticket", "book", "rk-head", "rk-exposure", "rk-conc", "rk-liq", "rk-margin", "rk-positions", "rk-daily", "rk-timeline", "rk-history"];
-const WS_TABS = ["dashboard", "risk", "pnl", "scanner", "markets", "history", "ai", "account", "tools"];
+const WS_TABS = ["dashboard", "risk", "pnl", "strategy", "scanner", "markets", "history", "ai", "account", "tools"];
 const WS_SYMBOL_RE = /^[A-Z0-9]{1,20}$/;
 
 function wsId() {

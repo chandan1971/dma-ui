@@ -51,6 +51,12 @@ _META_ID = "meta"
 # they are cached in-process and regenerate from the data.
 AI_CONVERSATIONS = "AI-Conversations"
 
+# Orders placed by the automated strategy (app/strategy_runner.py). `_id` =
+# exchange orderId. Joins the Trades mirror (by orderId) to build the
+# strategy's per-trade ledger, and lets a restarted runner cancel the
+# previous bar's resting orders.
+STRATEGY_ORDERS = "Strategy-Orders"
+
 _client: AsyncMongoClient | None = None
 _ca_temp_path: str | None = None
 
@@ -384,3 +390,45 @@ async def ai_conv_append(conv_id: str, messages: list[dict], updated_ms: int,
 async def ai_conv_delete(conv_id: str) -> bool:
     result = await _ai_convs().delete_one({"_id": conv_id})
     return result.deleted_count > 0
+
+
+# --------------------------------------------------------------------------
+# Automated strategy — placed-order registry + the fills behind them.
+# --------------------------------------------------------------------------
+def _strategy_orders():
+    return get_client()[settings.MONGO_DB_NAME][STRATEGY_ORDERS]
+
+
+async def strategy_order_insert(doc: dict) -> None:
+    await _strategy_orders().update_one(
+        {"_id": doc["_id"]},
+        {"$setOnInsert": {k: v for k, v in doc.items() if k != "_id"}},
+        upsert=True,
+    )
+
+
+async def strategy_order_ids(*, symbol: str | None = None, bar_t: int | None = None) -> list[str]:
+    filt: dict = {}
+    if symbol:
+        filt["symbol"] = symbol
+    if bar_t is not None:
+        filt["barT"] = bar_t
+    cursor = _strategy_orders().find(filt, projection={"_id": 1})
+    return [str(d["_id"]) for d in await cursor.to_list(length=None)]
+
+
+async def fills_for_orders(order_ids: list[str]) -> list[dict]:
+    """Execution rows (from the Trades mirror) for the given orderIds, oldest
+    first. `_id` is the execId and is returned as such."""
+    if not order_ids:
+        return []
+    cursor = (
+        collection(TRADES)
+        .find({"orderId": {"$in": order_ids}}, projection={"syncedAt": 0})
+        .sort("tsMs", ASCENDING)
+    )
+    rows = await cursor.to_list(length=None)
+    for r in rows:
+        r.setdefault("execId", r.pop("_id", None))
+        r.pop("_id", None)
+    return rows
