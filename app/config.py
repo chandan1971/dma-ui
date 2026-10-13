@@ -63,6 +63,25 @@ def _csv_env(name: str, default: list[str]) -> list[str]:
     return items or list(default)
 
 
+def _notional_overrides(raw: str) -> dict[str, float]:
+    """Parse "BTCUSDT=100,ETHUSDT=60" -> {"BTCUSDT": 100.0, ...}; bad or
+    non-positive entries are skipped with a log line (never crash the boot)."""
+    out: dict[str, float] = {}
+    for part in (raw or "").split(","):
+        if not part.strip():
+            continue
+        sym, _, amt = part.partition("=")
+        try:
+            value = float(amt)
+        except ValueError:
+            value = 0.0
+        if sym.strip() and value > 0:
+            out[sym.strip().upper()] = value
+        else:
+            print(f"[config] invalid STRATEGY_NOTIONAL_OVERRIDES entry {part!r}; ignored")
+    return out
+
+
 class Settings:
     def __init__(self) -> None:
         # --- CoinSwitch DMA credentials (NEVER hard-code) ---
@@ -159,6 +178,34 @@ class Settings:
         self.SCANNER_ENABLED: bool = (
             os.environ.get("SCANNER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
         )
+
+        # --- Automated EMA-cross strategy (app/strategy.py + strategy_runner.py) ---
+        # Two independent switches, both OFF by default:
+        #   STRATEGY_ENABLED=1  run the 4h loop: compute indicators/signals on each
+        #                       candle close and expose them at /api/strategy.
+        #   STRATEGY_LIVE=1     additionally PLACE orders (limit entries, reduce-only
+        #                       limit exits). Without it every intended order is
+        #                       logged as a dry run and nothing is sent.
+        self.STRATEGY_ENABLED: bool = (
+            os.environ.get("STRATEGY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+        )
+        self.STRATEGY_LIVE: bool = (
+            os.environ.get("STRATEGY_LIVE", "").strip().lower() in ("1", "true", "yes", "on")
+        )
+        self.STRATEGY_SYMBOLS: list[str] = _csv_env(
+            "STRATEGY_SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        )
+        # Fixed notional per trade per coin (settle coin), at STRATEGY_LEVERAGE.
+        self.STRATEGY_NOTIONAL: float = _float_env("STRATEGY_NOTIONAL", 50.0)
+        # Per-symbol override "SYM=amount,SYM=amount" (e.g. BTC's 0.001 minimum
+        # lot is worth more than the default notional).
+        self.STRATEGY_NOTIONAL_OVERRIDES: dict[str, float] = _notional_overrides(
+            os.environ.get("STRATEGY_NOTIONAL_OVERRIDES", "BTCUSDT=100")
+        )
+        self.STRATEGY_LEVERAGE: int = max(1, _int_env("STRATEGY_LEVERAGE", 1))
+        # Seconds after each 4h boundary before reading candles, so the venue has
+        # rolled the bar. The runner still verifies the bar actually closed.
+        self.STRATEGY_CLOSE_DELAY: float = _float_env("STRATEGY_CLOSE_DELAY", 10.0)
 
         # --- Overall unrealised-PnL tracker (READ-ONLY; needs Redis) ---
         # A background task (app/upnl.py) samples the account's total

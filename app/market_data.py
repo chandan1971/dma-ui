@@ -189,3 +189,16 @@ async def get_kline(symbol: str, interval: str, limit=None) -> dict:
             # already several seconds old and force an immediate refetch.
             _cache[key] = (time.monotonic(), data)
         return data
+
+
+async def get_kline_uncached(symbol: str, interval: str, limit: int) -> dict:
+    """Same public read as get_kline but bypassing the response cache — for the
+    strategy runner, which must see the venue's CURRENT bar set right after a
+    candle close, never a chart poll cached a second before the boundary.
+    `symbol` comes from server config (STRATEGY_SYMBOLS), not from a client;
+    the interval still goes through the fixed map."""
+    code = _INTERVALS.get(str(interval).lower())
+    if not code:
+        raise MarketDataError(400, "interval not allowed")
+    lim = max(1, min(_MAX_LIMIT, int(limit)))
+    return await _fetch_upstream(str(symbol).strip().upper(), code, lim)

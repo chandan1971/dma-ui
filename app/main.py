@@ -51,6 +51,8 @@ from . import (
     notifier,
     scanner,
     signer,
+    strategy_ledger,
+    strategy_runner,
     upnl,
 )
 from .config import settings
@@ -122,12 +124,15 @@ async def lifespan(app: FastAPI):
     # Background unrealised-PnL sampler: one positions read per interval,
     # persisted to Redis, feeds /api/upnl (no-op when REDIS_URL is unset).
     upnl_task = asyncio.create_task(upnl.run_sampler())
+    # 4h EMA-cross strategy loop (no-op unless STRATEGY_ENABLED; places orders
+    # only with STRATEGY_LIVE — otherwise every intended order is a dry run).
+    strategy_task = asyncio.create_task(strategy_runner.run_loop())
     try:
         yield
     finally:
         # The WS broadcaster is started lazily on the first client (so tests and
         # idle deploys never spin it); include it here if it is running.
-        tasks = [db_init, watcher, syncer, scanner_task, upnl_task]
+        tasks = [db_init, watcher, syncer, scanner_task, upnl_task, strategy_task]
         if _ws_broadcast_task is not None:
             tasks.append(_ws_broadcast_task)
         for task in tasks:
@@ -992,6 +997,41 @@ async def api_scanner(user: dict = Depends(current_user)):
     upstream call, so any number of scanner tabs cost the exchange nothing
     beyond the sampler's one poll per interval. Read-only market data."""
     return scanner.snapshot_response()
+
+
+@app.get("/api/strategy")
+async def api_strategy(user: dict = Depends(current_user)):
+    """Strategy status: mode (enabled / live / dry-run) and, per symbol, the
+    last closed 4h bar's indicators, signal, live position, actions and the
+    orders placed (or logged as dry-run). Served from memory; no upstream call."""
+    return strategy_runner.snapshot_response()
+
+
+@app.get("/api/strategy/trades")
+async def api_strategy_trades(user: dict = Depends(current_user)):
+    """Per-trade ledger of the automated strategy, built from the REAL fills
+    (Trades mirror) of the orders it placed: entry / exit average prices,
+    fees, realised PnL net of fees, and unrealised PnL at the live mark for
+    open trades. Fills appear once the history sync mirrors them (~1 min)."""
+    try:
+        ids = await db.strategy_order_ids()
+        fills = await db.fills_for_orders(ids)
+    except (PyMongoError, BSONError, OSError):
+        logger.exception("strategy ledger read failed: mongo unavailable")
+        raise HTTPException(status_code=503, detail="history database unavailable")
+    open_syms = {t["symbol"] for t in strategy_ledger.build_trades(fills)
+                 if t["status"] == "OPEN"}
+    marks: dict[str, float] = {}
+    for sym in sorted(open_syms):
+        try:
+            row = next(iter(_extract_list(await dma_client.get_tickers(sym))), None)
+            mark = float((row or {}).get("markPrice") or 0)
+            if math.isfinite(mark) and mark > 0:
+                marks[sym] = mark
+        except (dma_client.DMAError, TypeError, ValueError):
+            logger.warning("strategy ledger: no mark price for %s", sym)
+    trades = strategy_ledger.build_trades(fills, marks)
+    return {"trades": trades, "totals": strategy_ledger.totals(trades)}
 
 
 @app.get("/api/orderbook")

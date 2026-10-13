@@ -38,6 +38,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="2 12 6.5 12 9.5 5 14.5 19 17.5 12 22 12"/></svg>
           <span>PnL</span>
         </button>
+        <button class="tab" data-tab="strategy" role="tab" id="tab-strategy" aria-controls="panel-strategy" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="8" width="14" height="11" rx="2"/><line x1="12" y1="4" x2="12" y2="8"/><circle cx="9.5" cy="13" r="1"/><circle cx="14.5" cy="13" r="1"/></svg>
+          <span>Bot</span>
+        </button>
         <button class="tab" data-tab="scanner" role="tab" id="tab-scanner" aria-controls="panel-scanner" aria-selected="false" tabindex="-1">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="0.5"/><line x1="12" y1="3" x2="12" y2="7.5"/><line x1="16" y1="8" x2="19.5" y2="4.5"/></svg>
           <span>Scan</span>
@@ -533,6 +537,39 @@
              /api/upnl (a local Redis read — zero upstream calls per tab) and
              the live current value rides the shared WS snapshot. READ-ONLY:
              nothing in this pane can place, modify or cancel an order. -->
+        <!-- Bot: per-trade ledger of the automated 4h EMA-cross strategy
+             (strategy.js, /api/strategy/trades). READ-ONLY. -->
+        <div class="pane" data-pane="strategy" id="panel-strategy" role="tabpanel" aria-labelledby="tab-strategy" hidden>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Strategy Trades</h2>
+              <span id="st-status" class="muted" role="status" aria-live="polite"></span>
+            </div>
+            <p id="st-totals" class="muted"></p>
+            <div class="table-wrap">
+              <table id="st-table">
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Side</th>
+                    <th>Status</th>
+                    <th>Opened</th>
+                    <th>Qty</th>
+                    <th title="Average entry fill price">Entry</th>
+                    <th title="Average exit fill price (mark price while open)">Exit</th>
+                    <th>Closed</th>
+                    <th title="Trading fees paid on entry + exit fills (negative = rebate)">Fees</th>
+                    <th title="Realised PnL minus all fees paid">Realised</th>
+                    <th title="Open qty at the live mark, before the exit fee">Unrealised</th>
+                    <th title="Realised + Unrealised">Net</th>
+                  </tr>
+                </thead>
+                <tbody id="st-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+
         <div class="pane" data-pane="pnl" id="panel-pnl" role="tabpanel" aria-labelledby="tab-pnl" hidden>
           <section class="panel">
             <div class="panel-head">
@@ -1146,6 +1183,7 @@
   <script src="/static/charts.js"></script>
   <script src="/static/risk.js"></script>
   <script src="/static/pnl.js"></script>
+  <script src="/static/strategy.js"></script>
   <script src="/static/journal.js"></script>
   <script src="/static/ai.js"></script>
   <script src="/static/exec.js"></script>
