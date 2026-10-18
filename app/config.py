@@ -296,7 +296,6 @@ class Settings:
             "VIEWER_PASSWORD": self.VIEWER_PASSWORD,
             "SESSION_SECRET": self.SESSION_SECRET,
             "TRADE_TOKEN": self.TRADE_TOKEN,
-            "MONGO_URI": self.MONGO_URI,
         }
         missing = [name for name, value in required.items() if not value]
         # Mongo credentials may live inside MONGO_URI (both vars empty) or in the

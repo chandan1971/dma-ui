@@ -29,3 +29,6 @@ env/
 # Reference/source material — not part of the deployment, may contain secrets
 dma-api.json
 sign_server.py
+
+# Local history dumps (scripts/export_history.py)
+exports/

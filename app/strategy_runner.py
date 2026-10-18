@@ -29,10 +29,9 @@ Without STRATEGY_LIVE all intended orders are logged ("dry-run") and nothing
 is sent. On startup the newest closed bar is only ARMED (recorded, not
 traded) so a deploy/restart never acts on a bar that closed while down.
 One-way position mode only: a hedge-mode symbol is refused, never guessed.
-Every write emits a line on the "dma-ui.audit" logger with user "strategy",
-and every placed order is recorded in Mongo (Strategy-Orders) — the source for
-the per-trade ledger (app/strategy_ledger.py) and for cancelling the previous
-bar's resting orders after a restart.
+Every write emits a line on the "dma-ui.audit" logger with user "strategy".
+No database: after a restart the previous cycle's resting orders are found on
+the exchange by their creation time (see _previous_cycle_orders).
 """
 import asyncio
 import json
@@ -40,7 +39,7 @@ import logging
 import time
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
 
-from . import db, dma_client, market_data, notifier
+from . import dma_client, market_data, notifier
 from . import strategy as st
 from .config import settings
 
@@ -53,6 +52,9 @@ _FETCH_RETRIES = 6
 _FETCH_RETRY_SLEEP = 5.0
 # Bybit v5 "leverage not modified" — setting the leverage it already has.
 _RET_LEVERAGE_UNCHANGED = 110043
+# The runner places its orders within this long after a 4h close (close delay
+# + bar-roll retries + per-symbol work), used to recognise them after a restart.
+_BOT_PLACE_WINDOW_MS = 5 * 60 * 1000
 
 _state: dict[str, dict] = {}
 _instruments: dict[str, dict] = {}
@@ -171,15 +173,34 @@ def _audit(action: str, body: dict, outcome: str, **extra) -> None:
     log("%s", json.dumps(entry, default=str))
 
 
-async def _cancel_ours(sym: str, s: dict, prev_bar_t: int) -> None:
+async def _previous_cycle_orders(sym: str, placed_from_ms: int) -> list[str]:
+    """After a restart memory is empty, so find the previous cycle's resting
+    orders on the exchange instead: open LIMIT orders on this symbol created
+    in the few minutes right after the last 4h close — when the runner places
+    its orders. A manual limit order placed in that same window on a strategy
+    symbol would be cancelled too."""
+    lst = dma_client.extract_list(await dma_client.get_open_orders())
+    out = []
+    for o in lst:
+        try:
+            created = int(o.get("createdTime") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (str(o.get("symbol", "")).upper() == sym
+                and str(o.get("orderType", "")) == "Limit"
+                and placed_from_ms <= created <= placed_from_ms + _BOT_PLACE_WINDOW_MS
+                and o.get("orderId")):
+            out.append(str(o["orderId"]))
+    return out
+
+
+async def _cancel_ours(sym: str, s: dict, placed_from_ms: int) -> None:
     ids = list(s["our_orders"])
-    # After a restart memory is empty: the registry still knows what was
-    # placed on the previous bar, so those resting orders get cancelled too.
-    try:
-        ids += [i for i in await db.strategy_order_ids(symbol=sym, bar_t=prev_bar_t)
-                if i not in ids]
-    except Exception:
-        logger.exception("strategy %s: order registry unavailable", sym)
+    if not ids:
+        try:
+            ids = await _previous_cycle_orders(sym, placed_from_ms)
+        except dma_client.DMAError:
+            logger.exception("strategy %s: could not list open orders", sym)
     for oid in ids:
         try:
             await dma_client.cancel_order(sym, oid)
@@ -203,22 +224,7 @@ async def _ensure_leverage(sym: str) -> None:
     _leverage_ok.add(sym)
 
 
-async def _record(oid: str, sym: str, order: dict, action: str, bar_t: int) -> None:
-    """Registry write for the trade ledger. Never blocks trading: the order is
-    already live, so a Mongo failure is logged and alerted, not raised."""
-    try:
-        await db.strategy_order_insert({
-            "_id": oid, "symbol": sym, "action": action, "side": order["side"],
-            "qty": order["qty"], "price": order["price"], "barT": bar_t,
-            "placedMs": int(time.time() * 1000),
-        })
-    except Exception:
-        logger.exception("strategy %s: could not record order %s", sym, oid)
-        await notifier.notify(f"[strategy] {sym}: order {oid} placed but NOT recorded "
-                              "in the ledger (Mongo unavailable)")
-
-
-async def _place(sym: str, s: dict, order: dict, action: str, bar_t: int) -> dict:
+async def _place(sym: str, s: dict, order: dict, action: str) -> dict:
     if not settings.STRATEGY_LIVE:
         _audit("strategy." + action, order, "dry-run")
         return {"action": action, "order": order, "status": "dry-run"}
@@ -231,7 +237,6 @@ async def _place(sym: str, s: dict, order: dict, action: str, bar_t: int) -> dic
     oid = ((res or {}).get("result") or {}).get("orderId")
     if oid:
         s["our_orders"].append(oid)
-        await _record(oid, sym, order, action, bar_t)
     _audit("strategy." + action, order, "ok", orderId=oid)
     return {"action": action, "order": order, "status": "placed", "orderId": oid}
 
@@ -275,7 +280,7 @@ async def process_bar(sym: str, now_ms: int, *, arm_only: bool = False) -> dict:
     s["last_bar_t"] = bar_t
 
     if settings.STRATEGY_LIVE:
-        await _cancel_ours(sym, s, bar_t - BAR_MS)
+        await _cancel_ours(sym, s, bar_t)
     pos, size = await _live_position(sym)
     actions = st.decide(pos, sig, px, ind["ema200"][i])
     actions = _with_exit_chase(s, pos, actions, sig, px, ind["ema200"][i])
@@ -287,7 +292,7 @@ async def process_bar(sym: str, now_ms: int, *, arm_only: bool = False) -> dict:
             order = {"symbol": sym, "side": "Sell" if a == "CLOSE_LONG" else "Buy",
                      "orderType": "Limit", "qty": size, "price": price,
                      "timeInForce": "GTC", "reduceOnly": True, "positionIdx": 0}
-            snap["orders"].append(await _place(sym, s, order, "exit", bar_t))
+            snap["orders"].append(await _place(sym, s, order, "exit"))
             s["pending_exit"] = pos
         else:
             qty = entry_qty(notional_for(sym), px, inst["qty_step"], inst["min_qty"])
@@ -300,7 +305,7 @@ async def process_bar(sym: str, now_ms: int, *, arm_only: bool = False) -> dict:
             order = {"symbol": sym, "side": "Buy" if a == "OPEN_LONG" else "Sell",
                      "orderType": "Limit", "qty": qty, "price": price,
                      "timeInForce": "GTC", "positionIdx": 0}
-            snap["orders"].append(await _place(sym, s, order, "entry", bar_t))
+            snap["orders"].append(await _place(sym, s, order, "entry"))
 
     snap.update(position=pos, actions=actions, pending_exit=s["pending_exit"])
     s["last"] = snap

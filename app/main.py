@@ -111,13 +111,20 @@ async def lifespan(app: FastAPI):
                 "mongo unavailable at startup — history reads/sync degraded until it recovers"
             )
 
-    db_init = asyncio.create_task(_init_db())
+    async def _mongo_disabled() -> None:
+        logger.info("MONGO_URI not set — history mirror, journal and AI history disabled")
+
+    # Mongo is optional: without MONGO_URI neither the boot ping nor the
+    # history sync runs, and the Mongo-backed tabs answer 503.
+    db_init = asyncio.create_task(_init_db() if settings.MONGO_URI else _mongo_disabled())
     # Background execution-alert watcher (Telegram). Runs for the app's lifetime,
     # independent of any browser; a no-op if alerts aren't configured.
     watcher = asyncio.create_task(notifier.run_watcher())
     # Background history sync: the ONLY place the exchange's trade/closed-PnL
     # history is fetched from; the dashboard reads MongoDB.
-    syncer = asyncio.create_task(history_sync.run_scheduler())
+    syncer = asyncio.create_task(
+        history_sync.run_scheduler() if settings.MONGO_URI else asyncio.sleep(0)
+    )
     # Background market-scanner sampler: ONE shared ticker poll per interval
     # feeds /api/scanner for every viewer (read-only; no-op when disabled).
     scanner_task = asyncio.create_task(scanner.run_sampler())
@@ -1008,30 +1015,40 @@ async def api_strategy(user: dict = Depends(current_user)):
 
 
 @app.get("/api/strategy/trades")
-async def api_strategy_trades(user: dict = Depends(current_user)):
-    """Per-trade ledger of the automated strategy, built from the REAL fills
-    (Trades mirror) of the orders it placed: entry / exit average prices,
-    fees, realised PnL net of fees, and unrealised PnL at the live mark for
-    open trades. Fills appear once the history sync mirrors them (~1 min)."""
-    try:
-        ids = await db.strategy_order_ids()
-        fills = await db.fills_for_orders(ids)
-    except (PyMongoError, BSONError, OSError):
-        logger.exception("strategy ledger read failed: mongo unavailable")
-        raise HTTPException(status_code=503, detail="history database unavailable")
-    open_syms = {t["symbol"] for t in strategy_ledger.build_trades(fills)
-                 if t["status"] == "OPEN"}
+async def api_strategy_trades(user: dict = Depends(current_user), days: int = 30):
+    """Per-trade ledger for the strategy symbols, built from the exchange's own
+    fill history (last `days`, max 31) plus the live position: entry / exit
+    average fill prices, fees, realised PnL net of fees, and unrealised PnL at
+    the live mark. No database. ALL fills on these symbols count, so keep them
+    bot-only for a clean ledger. A position already open before the window is
+    reported with an unknown entry instead of an invented one."""
+    fills: list[dict] = []
+    opening: dict[str, float] = {}
     marks: dict[str, float] = {}
-    for sym in sorted(open_syms):
-        try:
-            row = next(iter(_extract_list(await dma_client.get_tickers(sym))), None)
-            mark = float((row or {}).get("markPrice") or 0)
-            if math.isfinite(mark) and mark > 0:
-                marks[sym] = mark
-        except (dma_client.DMAError, TypeError, ValueError):
-            logger.warning("strategy ledger: no mark price for %s", sym)
-    trades = strategy_ledger.build_trades(fills, marks)
-    return {"trades": trades, "totals": strategy_ledger.totals(trades)}
+    truncated = False
+    for sym in settings.STRATEGY_SYMBOLS:
+        hist = await dma_client.get_executions_history(sym, days=days)
+        rows = [r for r in _extract_list(hist)
+                if str(r.get("symbol", "")).upper() == sym
+                and str(r.get("execType", "Trade")) in ("Trade", "")]
+        truncated = truncated or bool((hist.get("result") or {}).get("truncated"))
+        fills += rows
+        live = 0.0
+        for pos in _extract_list(await dma_client.get_position_by_symbol(sym)):
+            size = _safe_float(pos.get("size"))
+            if size > 0 and str(pos.get("side", "")).lower() in ("buy", "sell"):
+                live += size if str(pos.get("side")).lower() == "buy" else -size
+                mark = _safe_float(pos.get("markPrice"))
+                if mark > 0:
+                    marks[sym] = mark
+        net = sum((_safe_float(r.get("execQty")) if str(r.get("side", "")).lower() == "buy"
+                   else -_safe_float(r.get("execQty"))) for r in rows)
+        seed = live - net
+        if abs(seed) > 1e-9:
+            opening[sym] = seed
+    trades = strategy_ledger.build_trades(fills, marks, opening)
+    return {"trades": trades, "totals": strategy_ledger.totals(trades),
+            "days": max(1, min(int(days), 31)), "truncated": truncated}
 
 
 @app.get("/api/orderbook")

@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from app import db, dma_client, market_data, notifier
+from app import dma_client, market_data, notifier
 from app import strategy as st
 from app import strategy_runner as sr
 from app.config import settings
@@ -33,6 +33,7 @@ class FakeExchange:
         self.leverage_calls = 0
         self.kline_last = LAST_CLOSED
         self.close = 100.0
+        self.resting: list[dict] = []   # exchange open orders
 
     async def kline(self, sym, interval, limit):
         return _klines(self.kline_last, self.close)
@@ -50,6 +51,9 @@ class FakeExchange:
     async def create_order(self, body):
         self.orders.append(body)
         return {"retCode": 0, "result": {"orderId": f"o{len(self.orders)}"}}
+
+    async def open_orders(self):
+        return {"retCode": 0, "result": {"list": self.resting}}
 
     async def cancel_order(self, sym, oid):
         self.cancelled.append(oid)
@@ -73,18 +77,7 @@ def ex(monkeypatch):
     async def _quiet(text):
         return None
     monkeypatch.setattr(notifier, "notify", _quiet)
-    # Order registry (Mongo) — in-memory stand-in.
-    fx.registry = {}
-
-    async def reg_insert(doc):
-        fx.registry[doc["_id"]] = doc
-
-    async def reg_ids(symbol=None, bar_t=None):
-        return [k for k, d in fx.registry.items()
-                if (symbol is None or d["symbol"] == symbol)
-                and (bar_t is None or d["barT"] == bar_t)]
-    monkeypatch.setattr(db, "strategy_order_insert", reg_insert)
-    monkeypatch.setattr(db, "strategy_order_ids", reg_ids)
+    monkeypatch.setattr(dma_client, "get_open_orders", fx.open_orders)
     monkeypatch.setattr(sr, "_state", {})
     monkeypatch.setattr(sr, "_instruments", {})
     monkeypatch.setattr(sr, "_leverage_ok", set())
@@ -260,27 +253,38 @@ def test_snapshot_response_shape(ex, monkeypatch):
     assert body["symbols"][SYM]["signal"] == st.BUY
 
 
-def test_placed_orders_recorded_in_registry(ex, monkeypatch):
-    ex.position = ("Buy", "0.48")
-    _force(monkeypatch, st.SELL, 110.0)
-    run(sr.process_bar(SYM, NOW))
-    assert set(ex.registry) == {"o1", "o2"}
-    assert ex.registry["o1"]["action"] == "exit" and ex.registry["o1"]["barT"] == LAST_CLOSED
-    assert ex.registry["o2"]["action"] == "entry"
+def _resting(oid, created, sym=SYM, otype="Limit"):
+    return {"orderId": oid, "symbol": sym, "orderType": otype, "createdTime": str(created)}
 
 
-def test_restart_cancels_previous_bar_orders_from_registry(ex, monkeypatch):
-    ex.registry["old1"] = {"symbol": SYM, "barT": LAST_CLOSED - BAR}
-    ex.registry["older"] = {"symbol": SYM, "barT": LAST_CLOSED - 2 * BAR}
+def test_restart_cancels_previous_cycle_orders_found_on_exchange(ex, monkeypatch):
+    # Previous cycle ran right after LAST_CLOSED opened... i.e. at the prior close.
+    ex.resting = [
+        _resting("bot1", LAST_CLOSED + 20_000),             # placed by the runner
+        _resting("manual", LAST_CLOSED + 10 * 60_000),       # outside the window
+        _resting("other", LAST_CLOSED + 20_000, sym="ETHUSDT"),
+        _resting("mkt", LAST_CLOSED + 20_000, otype="Market"),
+    ]
     _force(monkeypatch, None, 90.0)
-    run(sr.process_bar(SYM, NOW))           # fresh process: memory empty
-    assert ex.cancelled == ["old1"]
+    run(sr.process_bar(SYM, NOW))                            # fresh process: memory empty
+    assert ex.cancelled == ["bot1"]
 
 
-def test_registry_failure_does_not_block_trading(ex, monkeypatch):
-    async def down(doc):
-        raise RuntimeError("mongo down")
-    monkeypatch.setattr(db, "strategy_order_insert", down)
+def test_in_memory_orders_take_precedence_over_lookup(ex, monkeypatch):
+    ex.position = ("Buy", "0.48")
+    _force(monkeypatch, st.SELL, 90.0)
+    run(sr.process_bar(SYM, NOW))                            # places o1
+    ex.resting = [_resting("bot-old", LAST_CLOSED + BAR + 5_000)]
+    ex.kline_last = LAST_CLOSED + BAR
+    _force(monkeypatch, None, 90.0)
+    run(sr.process_bar(SYM, NOW + BAR))
+    assert ex.cancelled == ["o1"]
+
+
+def test_open_order_lookup_failure_does_not_block(ex, monkeypatch):
+    async def down():
+        raise dma_client.DMAError(502, "gateway")
+    monkeypatch.setattr(dma_client, "get_open_orders", down)
     _force(monkeypatch, st.BUY, 90.0)
     snap = run(sr.process_bar(SYM, NOW))
     assert snap["orders"][0]["status"] == "placed"

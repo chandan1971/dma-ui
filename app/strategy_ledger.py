@@ -1,8 +1,13 @@
 """Per-trade ledger for the automated strategy — built from REAL fills.
 
-Input is the exchange's own executions (the `Trades` Mongo mirror) for the
-orders the strategy placed, so prices, quantities and fees are what actually
-filled — not the limit prices requested. Pure: no I/O.
+Input is the exchange's own executions (fill history) for the strategy
+symbols, so prices, quantities and fees are what actually filled — not the
+limit prices requested. Pure: no I/O.
+
+History only reaches back a limited window. A position already open when the
+window starts is passed in as `opening` (signed qty); its entry price is
+unknown, so that trade reports entryPrice/realised/unrealised as None and
+`entryBeforeWindow` True rather than inventing a cost basis.
 
 Accounting (per symbol, fills in time order, average-cost basis):
   * a trade runs from flat to flat;
@@ -28,9 +33,10 @@ def _f(v) -> float:
         return 0.0
 
 
-def _new_trade(symbol: str, direction: int, ts: int) -> dict:
+def _new_trade(symbol: str, direction: int, ts: int | None) -> dict:
     return {
         "symbol": symbol, "direction": direction, "openedMs": ts, "closedMs": None,
+        "known": True,
         "avg": 0.0, "openQty": 0.0, "entryQty": 0.0, "entryValue": 0.0,
         "exitQty": 0.0, "exitValue": 0.0, "entryFee": 0.0, "exitFee": 0.0,
         "gross": 0.0,
@@ -40,10 +46,11 @@ def _new_trade(symbol: str, direction: int, ts: int) -> dict:
 def _finish(t: dict, mark: float | None) -> dict:
     closed = t["openQty"] <= _EPS
     fees = t["entryFee"] + t["exitFee"]
+    known = t["known"]
     unreal = None
-    if not closed and mark:
+    if not closed and mark and known:
         unreal = (mark - t["avg"]) * t["openQty"] * t["direction"]
-    realised = t["gross"] - fees
+    realised = t["gross"] - fees if known else None
     return {
         "symbol": t["symbol"],
         "side": "LONG" if t["direction"] > 0 else "SHORT",
@@ -52,19 +59,23 @@ def _finish(t: dict, mark: float | None) -> dict:
         "closedMs": t["closedMs"],
         "qty": t["entryQty"],
         "openQty": 0.0 if closed else t["openQty"],
-        "entryPrice": t["entryValue"] / t["entryQty"] if t["entryQty"] > _EPS else None,
+        "entryPrice": t["entryValue"] / t["entryQty"] if known and t["entryQty"] > _EPS else None,
+        "entryBeforeWindow": not known,
         "exitPrice": t["exitValue"] / t["exitQty"] if t["exitQty"] > _EPS else None,
         "markPrice": None if closed else mark,
         "fees": fees,
         "realisedPnl": realised,
         "unrealisedPnl": unreal,
-        "netPnl": realised + (unreal or 0.0),
+        "netPnl": None if realised is None else realised + (unreal or 0.0),
     }
 
 
-def build_trades(fills: list[dict], marks: dict[str, float] | None = None) -> list[dict]:
-    """Trades newest first. `marks` maps symbol -> mark price for open trades."""
+def build_trades(fills: list[dict], marks: dict[str, float] | None = None,
+                 opening: dict[str, float] | None = None) -> list[dict]:
+    """Trades newest first. `marks` maps symbol -> mark price for open trades;
+    `opening` maps symbol -> signed position qty held before the first fill."""
     marks = marks or {}
+    opening = opening or {}
     by_sym: dict[str, list[dict]] = defaultdict(list)
     for f in fills:
         if str(f.get("execType", "Trade")) not in ("Trade", ""):
@@ -72,9 +83,15 @@ def build_trades(fills: list[dict], marks: dict[str, float] | None = None) -> li
         by_sym[str(f.get("symbol", ""))].append(f)
 
     out: list[dict] = []
-    for sym, rows in by_sym.items():
+    for sym in set(by_sym) | {s for s, q in opening.items() if abs(q) > _EPS}:
+        rows = by_sym.get(sym, [])
         rows.sort(key=lambda r: (int(_f(r.get("tsMs") or r.get("execTime"))), str(r.get("execId", ""))))
         cur = None
+        seed = _f(opening.get(sym))
+        if abs(seed) > _EPS:
+            cur = _new_trade(sym, 1 if seed > 0 else -1, None)
+            cur["known"] = False
+            cur["openQty"] = cur["entryQty"] = abs(seed)
         for r in rows:
             qty, px, fee = _f(r.get("execQty")), _f(r.get("execPrice")), _f(r.get("execFee"))
             ts = int(_f(r.get("tsMs") or r.get("execTime")))
@@ -110,7 +127,7 @@ def build_trades(fills: list[dict], marks: dict[str, float] | None = None) -> li
         if cur is not None:
             out.append(_finish(cur, marks.get(sym)))
 
-    out.sort(key=lambda t: t["openedMs"], reverse=True)
+    out.sort(key=lambda t: t["openedMs"] or 0, reverse=True)
     return out
 
 
@@ -119,7 +136,8 @@ def totals(trades: list[dict]) -> dict:
         "trades": len(trades),
         "open": sum(t["status"] == "OPEN" for t in trades),
         "fees": sum(t["fees"] for t in trades),
-        "realisedPnl": sum(t["realisedPnl"] for t in trades),
+        "realisedPnl": sum(t["realisedPnl"] or 0.0 for t in trades),
         "unrealisedPnl": sum(t["unrealisedPnl"] or 0.0 for t in trades),
-        "netPnl": sum(t["netPnl"] for t in trades),
+        "netPnl": sum(t["netPnl"] or 0.0 for t in trades),
+        "entryBeforeWindow": sum(t["entryBeforeWindow"] for t in trades),
     }

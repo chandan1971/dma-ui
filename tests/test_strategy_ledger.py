@@ -92,35 +92,79 @@ def test_totals():
     assert tot["unrealisedPnl"] == pytest.approx(5)
 
 
+def test_opening_position_before_window_has_unknown_entry():
+    # Short 0.5 held before the window; only its exit fill is in history.
+    trades = lg.build_trades([fill("Buy", 0.5, 90, 0.02, 5)], opening={"SOLUSDT": -0.5})
+    t, = trades
+    assert t["status"] == "CLOSED" and t["side"] == "SHORT"
+    assert t["entryBeforeWindow"] is True and t["entryPrice"] is None
+    assert t["exitPrice"] == pytest.approx(90)
+    assert t["realisedPnl"] is None and t["netPnl"] is None
+    assert t["fees"] == pytest.approx(0.02)
+
+
+def test_opening_position_still_open_without_fills():
+    t, = lg.build_trades([], {"SOLUSDT": 100}, opening={"SOLUSDT": 1.0})
+    assert t["status"] == "OPEN" and t["entryBeforeWindow"] is True
+    assert t["unrealisedPnl"] is None
+    tot = lg.totals([t])
+    assert tot["entryBeforeWindow"] == 1 and tot["netPnl"] == 0
+
+
+def test_trade_after_unknown_one_is_fully_known():
+    trades = lg.build_trades([fill("Sell", 1, 100, 0, 1), fill("Buy", 1, 100, 0, 2),
+                              fill("Sell", 1, 90, 0, 3)], opening={"SOLUSDT": 1.0})
+    known, unknown = trades                            # newest first
+    assert unknown["entryBeforeWindow"] is True        # pre-window long, closed @100
+    assert unknown["exitPrice"] == pytest.approx(100)
+    assert known["entryBeforeWindow"] is False         # new long 100 -> 90
+    assert known["entryPrice"] == pytest.approx(100)
+    assert known["realisedPnl"] == pytest.approx(-10)
+
+
 # ---------------------------------------------------------------------------
-# /api/strategy/trades
+# /api/strategy/trades — exchange-backed, no database
 # ---------------------------------------------------------------------------
-def test_api_strategy_trades(admin_client, monkeypatch):
-    fills = [fill("Buy", 0.5, 100, 0.03, 1, oid="o1")]
+def _patch_exchange(monkeypatch, fills_by_sym, positions):
+    async def execs(symbol=None, days=None):
+        return {"retCode": 0, "result": {"list": fills_by_sym.get(symbol, []), "truncated": False}}
 
-    async def ids(**kw):
-        return ["o1"]
+    async def pos(symbol):
+        return {"retCode": 0, "result": {"list": positions.get(symbol, [])}}
+    monkeypatch.setattr(dma_client, "get_executions_history", execs)
+    monkeypatch.setattr(dma_client, "get_position_by_symbol", pos)
 
-    async def fills_for(order_ids):
-        assert order_ids == ["o1"]
-        return fills
 
-    async def tickers(sym=None):
-        return {"retCode": 0, "result": {"list": [{"symbol": sym, "markPrice": "104"}]}}
-    monkeypatch.setattr(db, "strategy_order_ids", ids)
-    monkeypatch.setattr(db, "fills_for_orders", fills_for)
-    monkeypatch.setattr(dma_client, "get_tickers", tickers)
+def test_api_strategy_trades_from_exchange(admin_client, monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "STRATEGY_SYMBOLS", ["SOLUSDT"])
+    _patch_exchange(monkeypatch,
+                    {"SOLUSDT": [fill("Buy", 0.5, 100, 0.03, 1),
+                                 fill("Sell", 0.5, 0, 0.1, 2, exec_type="Funding")]},
+                    {"SOLUSDT": [{"symbol": "SOLUSDT", "side": "Buy", "size": "0.5", "markPrice": "104"}]})
     r = admin_client.get("/api/strategy/trades")
     assert r.status_code == 200
     body = r.json()
-    assert body["trades"][0]["unrealisedPnl"] == pytest.approx(2.0)
+    t, = body["trades"]
+    assert t["entryBeforeWindow"] is False
+    assert t["unrealisedPnl"] == pytest.approx(2.0)
     assert body["totals"]["fees"] == pytest.approx(0.03)
+    assert body["days"] == 30
 
 
-def test_api_strategy_trades_mongo_down_is_503(admin_client, monkeypatch):
+def test_api_strategy_trades_seeds_position_opened_before_window(admin_client, monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "STRATEGY_SYMBOLS", ["SOLUSDT"])
+    _patch_exchange(monkeypatch, {"SOLUSDT": []},
+                    {"SOLUSDT": [{"symbol": "SOLUSDT", "side": "Sell", "size": "0.4", "markPrice": "95"}]})
+    t, = admin_client.get("/api/strategy/trades").json()["trades"]
+    assert t["side"] == "SHORT" and t["entryBeforeWindow"] is True and t["status"] == "OPEN"
+
+
+def test_mongo_optional_get_client_raises_pymongo_error(monkeypatch):
     from pymongo.errors import PyMongoError
-
-    async def boom(**kw):
-        raise PyMongoError("down")
-    monkeypatch.setattr(db, "strategy_order_ids", boom)
-    assert admin_client.get("/api/strategy/trades").status_code == 503
+    from app.config import settings
+    monkeypatch.setattr(settings, "MONGO_URI", "")
+    with pytest.raises(PyMongoError):
+        db.get_client()
+    assert "MONGO_URI" not in settings.missing_required()
